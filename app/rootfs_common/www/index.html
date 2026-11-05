@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'">
+  <title>VM Backup</title>
+  <link rel="stylesheet" href="./css/style.css?v=1.0.0">
+</head>
+<body>
+  <header class="top">
+    <h1>VM Backup</h1>
+    <nav aria-label="Sections">
+      <button type="button" class="tab" data-view="overview">Overview</button>
+      <button type="button" class="tab" data-view="jobs">Jobs</button>
+      <button type="button" class="tab" data-view="setup">Setup</button>
+    </nav>
+  </header>
+  <main id="view" tabindex="-1"></main>
+  <div id="toast" role="status" aria-live="polite" hidden></div>
+  <dialog id="dialog"></dialog>
+  <noscript>This app needs JavaScript.</noscript>
+  <script src="./js/ugos-sdk.js?v=1.0.0"></script>
+  <script src="./js/app.js?v=1.0.0"></script>
+</body>
+</html>

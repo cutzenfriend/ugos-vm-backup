@@ -1,0 +1,36 @@
+spec_version: "2.1"
+app_id: io.github.cutzenfriend.vmbackup
+version: 1.0.0
+support_arch:
+  - amd64
+  - arm64
+product_series:
+  - nasync
+start_cmd: bin/ugvm_serv --port=21847
+port: 21847
+proxy_path: api
+open_type: inner
+tag_types:
+  - utility
+depend_fw_version: 1.13.0.0000
+# The app needs no extra permissions: it only reads and writes folders the
+# administrator authorizes on its settings page. Backups run in the root script.
+allow_add_access_path: true
+only_admin: true
+i18n:
+  en-US:
+    name: VM Backup
+    description: Scheduled snapshots and full backups of your virtual machines, with folder selection and retention limits.
+    author: Cutzenfriend
+    official: https://github.com/cutzenfriend/ugos-vm-backup
+    help: https://github.com/cutzenfriend/ugos-vm-backup#readme
+    publisher: Cutzenfriend
+    publisher_link: https://github.com/cutzenfriend
+  zh-CN:
+    name: VM Backup
+    description: 定时为虚拟机创建快照和完整备份，可选择文件夹并设置保留期限。
+    author: Cutzenfriend
+    official: https://github.com/cutzenfriend/ugos-vm-backup
+    help: https://github.com/cutzenfriend/ugos-vm-backup#readme
+    publisher: Cutzenfriend
+    publisher_link: https://github.com/cutzenfriend

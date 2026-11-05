@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+#
+# Test double for virsh. VMs are folders in /tmp/fakevirt/<id> holding plain
+# files, so tests can arrange any state. Disk images and backups are real and
+# are handled by the real qemu-img from the test container.
+
+set -u
+ROOT=/tmp/fakevirt
+printf '%s\n' "$*" >>"$ROOT/calls"
+
+command=$1
+shift
+domain=""
+snapshot=""
+name=""
+description=""
+backupxml=""
+completed=0
+list_name=0
+title=0
+details=0
+while (($# > 0)); do
+  case "$1" in
+    --domain) domain=$2; shift 2 ;;
+    --snapshotname) snapshot=$2; shift 2 ;;
+    --name) if [[ $command == snapshot-create-as ]]; then name=$2; shift 2; else list_name=1; shift; fi ;;
+    --description) description=$2; shift 2 ;;
+    --backupxml) backupxml=$2; shift 2 ;;
+    --completed) completed=1; shift ;;
+    --title) title=1; shift ;;
+    --details) details=1; shift ;;
+    *) shift ;;
+  esac
+done
+dir="$ROOT/$domain"
+
+require_vm() {
+  [[ -n $domain && -d $dir ]] || { echo "error: failed to get domain '$domain'" >&2; exit 1; }
+}
+
+case "$command" in
+  domcapabilities)
+    [[ -f $ROOT/no-live-backup ]] || echo "  <backup supported='yes'/>"
+    ;;
+  list)
+    find "$ROOT" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort
+    echo
+    ;;
+  domstate)
+    require_vm
+    cat "$dir/state"
+    ;;
+  desc)
+    require_vm
+    if [[ -s $dir/title ]]; then cat "$dir/title"; else echo "No title for domain: $domain"; fi
+    ;;
+  domuuid)
+    require_vm
+    echo "11111111-2222-3333-4444-555555555555"
+    ;;
+  dominfo)
+    require_vm
+    printf 'CPU(s):         2\nMax memory:     2097152 KiB\n'
+    ;;
+  domiflist)
+    require_vm
+    printf ' Interface   Type     Source\n------\n vnet0       bridge   br0\n'
+    ;;
+  dumpxml)
+    require_vm
+    {
+      echo "<domain type='kvm'>"
+      [[ -f $dir/uefi ]] && echo "  <os><loader readonly='yes'/><nvram>$dir/nvram.bin</nvram></os>"
+      [[ -f $dir/agent ]] && echo "  <channel><target name='org.qemu.guest_agent.0'/></channel>"
+      while read -r target format path; do
+        echo "  <disk type='file' device='disk'>"
+        echo "    <driver name='qemu' type='$format' cache='none'/>"
+        echo "    <source file='$path'/>"
+        echo "    <target dev='$target' bus='virtio'/>"
+        echo "  </disk>"
+      done <"$dir/disks"
+      echo "  <disk type='file' device='cdrom'>"
+      echo "    <driver name='qemu' type='raw'/>"
+      echo "    <target dev='sdz' bus='sata'/>"
+      echo "  </disk>"
+      echo "</domain>"
+    } | sed 's/^$//'
+    ;;
+  domblklist)
+    require_vm
+    printf ' Type   Device   Target   Source\n-----\n'
+    while read -r target format path; do
+      printf ' file   disk   %s   %s\n' "$target" "$path"
+    done <"$dir/disks"
+    printf ' file   cdrom   sdz   -\n'
+    ;;
+  domfsfreeze)
+    require_vm
+    touch "$dir/was-frozen"
+    ;;
+  domfsthaw)
+    require_vm
+    touch "$dir/was-thawed"
+    ;;
+  backup-begin)
+    require_vm
+    [[ -f $ROOT/no-live-backup ]] && { echo "error: Operation not supported: backup" >&2; exit 1; }
+    while read -r target format path; do
+      out=$(sed -n "/<disk name='$target'/,/<\/disk>/s/.*<target file='\([^']*\)'.*/\1/p" "$backupxml")
+      out=${out//&amp;/&}
+      qemu-img convert -f "$format" -O qcow2 "$path" "$out" || exit 1
+    done <"$dir/disks"
+    if [[ -f $ROOT/backup-job-fails ]]; then
+      echo Failed >"$dir/job-result"
+    else
+      echo Completed >"$dir/job-result"
+    fi
+    ;;
+  domjobinfo)
+    require_vm
+    if ((completed == 1)); then
+      echo "Job type:         $(cat "$dir/job-result" 2>/dev/null || echo None)"
+    else
+      echo "Job type:         None"
+    fi
+    ;;
+  domjobabort)
+    touch "$dir/job-aborted"
+    ;;
+  shutdown)
+    require_vm
+    touch "$dir/was-shutdown"
+    [[ -f $ROOT/refuses-shutdown ]] || echo "shut off" >"$dir/state"
+    ;;
+  start)
+    require_vm
+    touch "$dir/was-started"
+    echo running >"$dir/state"
+    ;;
+  snapshot-create-as)
+    require_vm
+    [[ -f $ROOT/snapshot-fails ]] && { echo "error: internal snapshot not supported" >&2; exit 1; }
+    mkdir -p "$dir/snapshots"
+    printf '%s\n%s\n' "$description" "$(date +%s)" >"$dir/snapshots/$name"
+    ;;
+  snapshot-list)
+    require_vm
+    ls "$dir/snapshots" 2>/dev/null
+    echo
+    ;;
+  snapshot-dumpxml)
+    require_vm
+    [[ -f $dir/snapshots/$snapshot ]] || { echo "error: no snapshot" >&2; exit 1; }
+    {
+      read -r stored_description
+      read -r stored_time
+    } <"$dir/snapshots/$snapshot"
+    printf '<domainsnapshot>\n  <name>%s</name>\n  <description>%s</description>\n  <creationTime>%s</creationTime>\n</domainsnapshot>\n' \
+      "$snapshot" "$stored_description" "$stored_time"
+    ;;
+  snapshot-delete)
+    require_vm
+    rm -f "$dir/snapshots/$snapshot"
+    ;;
+  *)
+    echo "stub-virsh: unexpected command $command" >&2
+    exit 64
+    ;;
+esac

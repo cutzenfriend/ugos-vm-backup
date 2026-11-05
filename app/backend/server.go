@@ -19,7 +19,7 @@ import (
 
 const (
 	appVersion    = "1.0.0"
-	scriptVersion = "1.0.0"
+	scriptVersion = "1.0.1"
 
 	configSubfolder = "ugvm-backup"
 	configFile      = "config.ini"

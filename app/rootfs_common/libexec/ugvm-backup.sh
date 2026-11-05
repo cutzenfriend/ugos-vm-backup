@@ -21,7 +21,7 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export LIBVIRT_DEFAULT_URI=qemu:///system
 umask 077
 
-readonly VERSION="1.0.0"
+readonly VERSION="1.0.1"
 readonly CONFIG_FORMAT=1
 readonly MAX_CONFIG_BYTES=65536
 readonly MAX_JOBS=32
@@ -531,7 +531,7 @@ capture_live() {
   } >"$xml_file"
 
   local job_state
-  job_state=$(virsh domjobinfo --domain "$vm" 2>/dev/null | awk -F': *' '/^Job type/ {print $2}')
+  job_state=$(virsh domjobinfo --domain "$vm" 2>/dev/null | awk -F': *' '/^Job type/ {sub(/ +$/, "", $2); print $2}')
   if [[ -n $job_state && $job_state != None ]]; then
     fail "Another operation is already running on this VM"
     return 1
@@ -562,7 +562,7 @@ capture_live() {
 
   local started=$SECONDS
   while :; do
-    job_state=$(virsh domjobinfo --domain "$vm" 2>/dev/null | awk -F': *' '/^Job type/ {print $2}')
+    job_state=$(virsh domjobinfo --domain "$vm" 2>/dev/null | awk -F': *' '/^Job type/ {sub(/ +$/, "", $2); print $2}')
     [[ -z $job_state || $job_state == None ]] && break
     if ((SECONDS - started > BACKUP_TIMEOUT_SECONDS)); then
       virsh domjobabort --domain "$vm" >/dev/null 2>&1
@@ -577,7 +577,7 @@ capture_live() {
 
   # Only an explicit "Completed" counts: an aborted copy can still be a
   # structurally valid qcow2 file and would pass "qemu-img check" below.
-  job_state=$(virsh domjobinfo --domain "$vm" --completed 2>/dev/null | awk -F': *' '/^Job type/ {print $2}')
+  job_state=$(virsh domjobinfo --domain "$vm" --completed 2>/dev/null | awk -F': *' '/^Job type/ {sub(/ +$/, "", $2); print $2}')
   [[ $job_state == Completed ]] || { fail "Live backup did not finish successfully (${job_state:-no status})"; return 1; }
   return 0
 }

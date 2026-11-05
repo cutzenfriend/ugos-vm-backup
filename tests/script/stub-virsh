@@ -118,10 +118,11 @@ case "$command" in
     ;;
   domjobinfo)
     require_vm
+    # Real virsh pads the value and ends with an empty line ("%-17s %-12s\n").
     if ((completed == 1)); then
-      echo "Job type:         $(cat "$dir/job-result" 2>/dev/null || echo None)"
+      printf '%-17s %-12s\n\n' "Job type:" "$(cat "$dir/job-result" 2>/dev/null || echo None)"
     else
-      echo "Job type:         None"
+      printf '%-17s %-12s\n\n' "Job type:" "None"
     fi
     ;;
   domjobabort)

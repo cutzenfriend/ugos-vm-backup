@@ -118,3 +118,7 @@ docker run --rm --name ugvm-dev -p 8099:8099 -v "$PWD:/src:ro" golang:1.25-bookw
 ```
 
 An App Center store listing is unlikely, because the app depends on a root cron job.
+
+## License
+
+Released under the [MIT License](LICENSE).

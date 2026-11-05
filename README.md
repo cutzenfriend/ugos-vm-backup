@@ -29,7 +29,7 @@ Backups are stored in `<target folder>/<VM ID>/<type>-<job>-<time>/`. A folder o
 
 ## Installation
 
-You need UGOS Pro firmware 1.13 or later, SSH access, an administrator account, and Docker on the computer you build with.
+You need UGOS Pro firmware 1.13 or later, developer authorization from UGREEN for your device, SSH access, an administrator account, and Docker on the computer you build with.
 
 1. **Build the packages.** They end up in `dist/`:
 
@@ -37,7 +37,13 @@ You need UGOS Pro firmware 1.13 or later, SSH access, an administrator account, 
    bash build/build.sh
    ```
 
-2. **Allow custom packages.** On firmware 1.16 and later, go to App Center > Settings > App Development Settings. Earlier versions need a `ugdev.sig` from UGREEN.
+2. **Get developer authorization from UGREEN.** Until your device is authorized, App Center rejects the package with a security signature error.
+   - Email UGREEN your device's serial number, MAC address (Control Panel > About) and admin username, using the [template](https://developer.ugnas.com/template-en.docx). The address is on the [developer site](https://developer.ugnas.com/en/doc/flow.html).
+   - Rename the file you receive to `ugdev.sig` and upload it to the admin account's Personal Folder.
+   - On firmware 1.16 and later, go to App Center > Settings > App Development Settings and click Authorize.
+   - When the authorization expires, upload a new file on the same settings page.
+
+   Keep this file, your serial number and your MAC address out of public issues and repositories.
 3. **Install the package.** Use manual installation in App Center and pick the file for your CPU: `amd64` for Intel and AMD (such as DXP models), `arm64` for ARM.
 4. **Authorize folders.** In the app's App Center settings, allow the folders for the config and your backups.
 5. **Open the app and follow the Setup tab.** It shows the exact commands for your system to install the script and create the cron job.

@@ -4,8 +4,6 @@ Live backups of the VMs on a UGREEN NAS, from one script with a simple terminal 
 
 ![Main menu of the terminal interface](screenshots/main-menu.png)
 
-> **Status:** Early version. The interface and self-update work on a real NAS, and the backup method worked there by hand, with the VM frozen for 87 ms and the OVA imported into the Virtual Machine app. A complete backup through the script has only run against a stubbed `virsh` so far. Try it with an unimportant VM first and test a restore.
-
 This is an independent project and is not affiliated with UGREEN.
 
 ## Install

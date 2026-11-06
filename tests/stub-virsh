@@ -14,21 +14,12 @@ domain=""
 snapshot=""
 name=""
 description=""
-backupxml=""
-completed=0
-list_name=0
-title=0
-details=0
 while (($# > 0)); do
   case "$1" in
     --domain) domain=$2; shift 2 ;;
     --snapshotname) snapshot=$2; shift 2 ;;
-    --name) if [[ $command == snapshot-create-as ]]; then name=$2; shift 2; else list_name=1; shift; fi ;;
+    --name) if [[ $command == snapshot-create-as ]]; then name=$2; shift 2; else shift; fi ;;
     --description) description=$2; shift 2 ;;
-    --backupxml) backupxml=$2; shift 2 ;;
-    --completed) completed=1; shift ;;
-    --title) title=1; shift ;;
-    --details) details=1; shift ;;
     *) shift ;;
   esac
 done
@@ -39,9 +30,6 @@ require_vm() {
 }
 
 case "$command" in
-  domcapabilities)
-    [[ -f $ROOT/no-live-backup ]] || echo "  <backup supported='yes'/>"
-    ;;
   list)
     find "$ROOT" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort
     echo
@@ -49,6 +37,7 @@ case "$command" in
   domstate)
     require_vm
     cat "$dir/state"
+    echo
     ;;
   desc)
     require_vm
@@ -58,33 +47,27 @@ case "$command" in
     require_vm
     echo "11111111-2222-3333-4444-555555555555"
     ;;
-  dominfo)
-    require_vm
-    printf 'CPU(s):         2\nMax memory:     2097152 KiB\n'
-    ;;
-  domiflist)
-    require_vm
-    printf ' Interface   Type     Source\n------\n vnet0       bridge   br0\n'
-    ;;
   dumpxml)
     require_vm
     {
       echo "<domain type='kvm'>"
+      echo "  <memory unit='KiB'>2097152</memory>"
+      echo "  <vcpu placement='static'>2</vcpu>"
       [[ -f $dir/uefi ]] && echo "  <os><loader readonly='yes'/><nvram>$dir/nvram.bin</nvram></os>"
-      [[ -f $dir/agent ]] && echo "  <channel><target name='org.qemu.guest_agent.0'/></channel>"
       while read -r target format path; do
         echo "  <disk type='file' device='disk'>"
         echo "    <driver name='qemu' type='$format' cache='none'/>"
         echo "    <source file='$path'/>"
-        echo "    <target dev='$target' bus='virtio'/>"
+        echo "    <target dev='$target' bus='sata'/>"
         echo "  </disk>"
       done <"$dir/disks"
       echo "  <disk type='file' device='cdrom'>"
       echo "    <driver name='qemu' type='raw'/>"
       echo "    <target dev='sdz' bus='sata'/>"
       echo "  </disk>"
+      echo "  <interface type='bridge'><source bridge='br0'/></interface>"
       echo "</domain>"
-    } | sed 's/^$//'
+    }
     ;;
   domblklist)
     require_vm
@@ -92,51 +75,24 @@ case "$command" in
     while read -r target format path; do
       printf ' file   disk   %s   %s\n' "$target" "$path"
     done <"$dir/disks"
-    printf ' file   cdrom   sdz   -\n'
+    printf ' file   cdrom   sdz   -\n\n'
+    ;;
+  domfsinfo)
+    require_vm
+    [[ -f $ROOT/freeze-fails ]] && { echo "error: guest agent is not responding" >&2; exit 1; }
+    printf ' Mountpoint   Name   Type   Target\n-----\n /   sda1   ext4   sda\n\n'
     ;;
   domfsfreeze)
     require_vm
-    touch "$dir/was-frozen"
+    [[ -f $ROOT/freeze-fails ]] && { echo "error: guest agent is not responding" >&2; exit 1; }
+    touch "$dir/was-frozen" "$dir/frozen"
+    echo "Froze 1 filesystem(s)"
     ;;
   domfsthaw)
     require_vm
     touch "$dir/was-thawed"
-    ;;
-  backup-begin)
-    require_vm
-    [[ -f $ROOT/no-live-backup ]] && { echo "error: Operation not supported: backup" >&2; exit 1; }
-    while read -r target format path; do
-      out=$(sed -n "/<disk name='$target'/,/<\/disk>/s/.*<target file='\([^']*\)'.*/\1/p" "$backupxml")
-      out=${out//&amp;/&}
-      qemu-img convert -f "$format" -O qcow2 "$path" "$out" || exit 1
-    done <"$dir/disks"
-    if [[ -f $ROOT/backup-job-fails ]]; then
-      echo Failed >"$dir/job-result"
-    else
-      echo Completed >"$dir/job-result"
-    fi
-    ;;
-  domjobinfo)
-    require_vm
-    # Real virsh pads the value and ends with an empty line ("%-17s %-12s\n").
-    if ((completed == 1)); then
-      printf '%-17s %-12s\n\n' "Job type:" "$(cat "$dir/job-result" 2>/dev/null || echo None)"
-    else
-      printf '%-17s %-12s\n\n' "Job type:" "None"
-    fi
-    ;;
-  domjobabort)
-    touch "$dir/job-aborted"
-    ;;
-  shutdown)
-    require_vm
-    touch "$dir/was-shutdown"
-    [[ -f $ROOT/refuses-shutdown ]] || echo "shut off" >"$dir/state"
-    ;;
-  start)
-    require_vm
-    touch "$dir/was-started"
-    echo running >"$dir/state"
+    rm -f "$dir/frozen"
+    echo "Thawed 1 filesystem(s)"
     ;;
   snapshot-create-as)
     require_vm
@@ -164,6 +120,7 @@ case "$command" in
     rm -f "$dir/snapshots/$snapshot"
     ;;
   *)
+    # shutdown, destroy, start and everything else must never be called.
     echo "stub-virsh: unexpected command $command" >&2
     exit 64
     ;;

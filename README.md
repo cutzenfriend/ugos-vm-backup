@@ -1,129 +1,137 @@
 # VM Backup for UGOS
 
-Backs up the VMs of the UGOS Virtual Machine app. It creates snapshots, file backups and OVA exports, each with its own schedule, target folder and retention limits by count and age.
+Live backups of the VMs on a UGREEN NAS, from one script with a simple terminal interface. Running VMs are never shut down.
 
-> **Status:** Tested against a stubbed `virsh` and the real `qemu-img`, but it has not run on a real UGREEN NAS yet. Start with a throwaway VM and work through the [checks below](#checks-on-the-nas).
+> **Status:** Early version. The backup method worked by hand on a real NAS, where the VM was frozen for 87 ms and the OVA imported into the Virtual Machine app. The complete script has only run against a stubbed `virsh` so far. Try it with an unimportant VM first and test a restore.
 
 This is an independent project and is not affiliated with UGREEN.
 
-## How it works
+## Install
 
-| Part | Runs as | Job |
-|---|---|---|
-| **App** (`.upk`) | Non-root, in the UGOS sandbox | Provides the interface, writes `config.ini`, reads the status |
-| **Script** (`ugvm-backup`) | root, from cron every 10 minutes | Checks what is due and runs the backups |
+Create a shared folder for your backups, for example `VMBackup` on Volume 1. Then connect to the NAS over SSH and run:
 
-The two only communicate through files in the config folder you choose. No stored password or permanently running root service is needed.
+```bash
+curl -fsSL https://raw.githubusercontent.com/cutzenfriend/ugos-vm-backup/main/ugvm-backup.sh -o /volume1/VMBackup/ugvm-backup.sh && sudo bash /volume1/VMBackup/ugvm-backup.sh
+```
 
-| Type | What you get | Can the VM keep running? |
-|---|---|---|
-| Snapshot | An internal snapshot in the VM disk, like those UGOS creates | Yes, with a short pause. It doesn't protect against drive failure. |
-| File backup | Copies of the disks as qcow2, plus the VM definition, UEFI variables and TPM state | Your choice: live, shut down or skip |
-| OVA export | A single `vm.ova` plus the VM definition | Same choice as file backups |
+This downloads the script and opens the interface. If your folder has a different path, change it in both places.
 
-Backups are stored in `<target folder>/<VM ID>/<type>-<job>-<time>/`. A folder only gets this name once the copy is complete and verified.
+In the interface:
+
+1. **jobs** > **Create a job:** choose the VMs, the schedule and how long backups are kept.
+2. **cron:** turn on the schedule. It adds one line to root's crontab, which runs every 10 minutes. The script only acts when a job is due.
+
+To open the interface again:
+
+```bash
+sudo bash /volume1/VMBackup/ugvm-backup.sh
+```
+
+## Requirements
+
+- UGOS with SSH access and an administrator account
+- VM disks on a btrfs volume, without `nodatacow`
+- `qemu-guest-agent` running inside each VM you back up while it runs
+- `whiptail` and `curl`, which were already on the NAS this was tested on
+
+`--check` shows whether your NAS and VMs meet these requirements. It changes nothing:
+
+```bash
+sudo bash /volume1/VMBackup/ugvm-backup.sh --check
+```
+
+## How a backup works
+
+1. The guest agent freezes the file systems inside the VM.
+2. btrfs clones the disk, which takes a moment because no data is copied yet.
+3. The VM continues.
+4. The script copies the clone to the backup folder, checks the copy and deletes the clone.
+
+A powered-off VM is copied directly. If a running VM can't be frozen or its disk can't be cloned, the job fails with an error. The script doesn't fall back to copying a disk in use, because that can produce a damaged backup.
+
+A frozen backup is as clean as a file system after a sync. Databases inside the VM may run their normal recovery when restored.
+
+## Files
+
+Everything stays in one folder:
+
+```text
+/volume1/VMBackup/
+├── ugvm-backup.sh
+├── config.ini
+├── ugvm-backup.log
+├── ugvm-state/
+└── MyVM-1a2b3c4d/
+    └── backup-<job>-<time>/
+        ├── sda.qcow2
+        ├── domain.xml
+        ├── manifest.txt
+        ├── nvram.fd            if the VM uses UEFI
+        ├── tpm-state.tar.gz    if the VM has a TPM
+        └── vm.ova              only if you created one
+```
+
+A backup folder only gets its final name once the copy is complete and checked.
+
+## Jobs
+
+| Type | What you get |
+|---|---|
+| Backup | A full copy of the disks and the VM definition |
+| Snapshot | A snapshot inside the VM disk, named like those UGOS creates. It doesn't protect against drive failure. |
 
 **Retention:** The count and age limits both apply, and 0 means no limit. The newest backup is never deleted, and nothing is deleted after a failed run. Only backups from the same job count, so snapshots you create manually in UGOS are left alone.
 
-**Schedule:** A new job first runs at its next scheduled time, so saving a job never shuts down a VM. After a failure, the next attempt comes an hour later at the earliest.
-
-## Installation
-
-You need UGOS Pro firmware 1.13 or later, developer authorization from UGREEN for your device, SSH access, an administrator account, and Docker on the computer you build with.
-
-1. **Build the packages.** They end up in `dist/`:
-
-   ```bash
-   bash build/build.sh
-   ```
-
-2. **Get developer authorization from UGREEN.** Until your device is authorized, App Center rejects the package with a security signature error.
-   - Email UGREEN your device's serial number, MAC address (Control Panel > About) and admin username, using the [template](https://developer.ugnas.com/template-en.docx). The address is on the [developer site](https://developer.ugnas.com/en/doc/flow.html).
-   - Rename the file you receive to `ugdev.sig` and upload it to the admin account's Personal Folder.
-   - On firmware 1.16 and later, go to App Center > Settings > App Development Settings and click Authorize.
-   - When the authorization expires, upload a new file on the same settings page.
-
-   Keep this file, your serial number and your MAC address out of public issues and repositories.
-3. **Install the package.** Use manual installation in App Center and pick the file for your CPU: `amd64` for Intel and AMD (such as DXP models), `arm64` for ARM.
-4. **Authorize folders.** In the app's App Center settings, allow the folders for the config and your backups.
-5. **Open the app and follow the Setup tab.** It shows the exact commands for your system to install the script and create the cron job.
-
-Only administrators should be able to write to the config folder. Anyone who can write there can trigger or redirect backups, even though the script validates every value.
-
-## Checks on the NAS
-
-These questions can't be settled without a real device. This read-only diagnostic script partly answers check 4:
-
-```bash
-sudo bash scripts/ugos-probe.sh
-```
-
-Its report describes your system, so read it before you share it.
-
-| # | Question | If it fails |
-|---|---|---|
-| 1 | Does the app start and open in the UGOS window? | The backend only listens on `127.0.0.1`. If UGOS can't reach it there, add `--listen` in `project.yaml`. |
-| 2 | Does Setup show authorized folders with a `/volumeN/…` path? | The app reads the path from the folder's symlink. If the sandbox shows something else, the mapping needs changing. |
-| 3 | Does the install command find `/var/packages/<app>/libexec/ugvm-backup.sh`? | Correct the path using the error message. |
-| 4 | Does a live backup of a running VM work? | QEMU must be able to write to the target folder. Otherwise choose the shutdown option in the job. |
-| 5 | Do this app's snapshots appear correctly in the UGOS interface? | If not, don't use snapshot jobs. File backups aren't affected. |
-| 6 | Can the Virtual Machine app import the generated `vm.ova`? | Use file backups until the OVF is adjusted. |
-| 7 | Does the cron job survive a UGOS update? | The Overview warns after 30 minutes without a report from the script and shows the line again. |
-| 8 | Can a file backup actually be restored? | This applies to any backup tool: only a successful restore proves a backup works. |
+**Schedule:** A new job first runs at its next scheduled time. After a failure, the next attempt comes an hour later at the earliest.
 
 ## Restoring
 
-A file backup is a regular qcow2 disk. With the VM powered off, copy it back over SSH:
+**As a new VM:** Under **backups**, choose a backup and then **Create OVA for importing**. Import `vm.ova` in the Virtual Machine app. Disconnect the network before the first start if the original VM is still running, because the copy has the same hostname and services.
+
+**Over an existing VM:** With the VM powered off, copy the disk back:
 
 ```bash
-sudo cp <backup>/vda.qcow2 <disk-path-from-virsh-domblklist>
+sudo cp <backup>/sda.qcow2 <disk-path-from-virsh-domblklist>
 ```
 
-OVA files can be imported in the Virtual Machine app (see check 6), and snapshots restored in the UGOS interface.
+This overwrites the VM's current disk, including its UGOS snapshots.
 
-## Removing
+## Commands
 
-1. Remove the line from root's crontab with `sudo crontab -e`.
-2. Delete the script and its state:
+| Command | What it does |
+|---|---|
+| `--run` | Runs what is due, for cron |
+| `--now JOB` | Runs one job immediately |
+| `--ova BACKUP_DIR` | Creates an OVA from a backup, even if the VM no longer exists |
+| `--check` | Shows what the script finds on this NAS |
+| `--update [--yes]` | Updates the script from GitHub |
+| `--version` | Shows the version |
 
-   ```bash
-   sudo rm -rf /usr/local/sbin/ugvm-backup /var/lib/ugvm-backup
-   ```
+## Updating
 
-3. Uninstall the app in App Center. Your backups are kept.
+**update** in the interface compares your version with the one on GitHub and installs a newer one after you confirm. Cron never updates the script. The previous version stays next to it as `ugvm-backup.sh.previous`.
 
 ## Security
 
-- **The script is the security boundary.** It treats `config.ini` as untrusted: it reads it line by line, checks it against fixed patterns, and never executes it.
-- **Target folders** must be under `/volumeN/`, with no `..` and no `@` system folders such as `@kvm`, even after symlinks are resolved.
-- **The disk format** always comes from the VM definition, so a VM can't pull host files into a backup through a crafted disk.
-- **Self-protection:** The script refuses to start if non-root users can change it or its folder.
-- **No commands from the app:** It can only save settings and request a run. It needs no `permissions` entry and no `SYSTEM.EXEC_SYSTEM_COMMAND`.
-- **Access** is limited to administrators, checked through the headers set by the UGOS gateway.
+- The script runs as root from cron, so only people you trust as root should be able to write to its folder.
+- `config.ini` is only read as data and is never executed. Invalid values are rejected.
+- The disk format always comes from the VM definition, so a VM can't pull host files into a backup through a crafted disk.
+- Updates come from this repository over HTTPS and aren't signed.
 
-Remaining risk: the script runs as root. Between its check and its write, someone with write access to the target folder could swap folders there. The damage is limited because the script only writes fixed file names, but only administrators should be able to write to the target and config folders.
+## Removing
+
+1. Under **cron**, turn off the schedule.
+2. Delete `ugvm-backup.sh`, `config.ini`, `ugvm-backup.log` and `ugvm-state` from the folder. Your backups are the folders next to them.
 
 ## Development
 
-Everything runs in Docker, and nothing is installed on the host.
+The tests run in a disposable Debian 12 container and also drive the real `whiptail` in a pseudo terminal:
 
 ```bash
 bash tests/run-in-docker.sh
 ```
 
-```bash
-bash build/build.sh 2
-```
-
-The build number must increase for the same version, or UGOS won't accept the update. When you change the script, increase `VERSION` in the script and `scriptVersion` in `app/backend/server.go`. A test checks that they match.
-
-To work on the interface, this starts a test environment with stubbed VMs at http://localhost:8099:
-
-```bash
-docker run --rm --name ugvm-dev -p 8099:8099 -v "$PWD:/src:ro" golang:1.25-bookworm bash /src/tests/dev/run-in-container.sh
-```
-
-An App Center store listing is unlikely, because the app depends on a root cron job.
+When you change the script, increase `VERSION` at the top of it. Otherwise `--update` won't offer the change to anyone.
 
 ## License
 

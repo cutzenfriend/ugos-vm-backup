@@ -1,17 +1,9 @@
-# Build output
-dist/
-
-# Local tooling and editor files
-.vscode/
-.idea/
 .DS_Store
 
-# Diagnostics reports can describe your NAS
-ugos-probe-*.txt
-
-# Never commit secrets
+# Never commit data from a NAS or secrets
+config.ini
+ugvm-backup.log
+ugvm-state/
 .env
-.env.*
 *.pem
 *.key
-ugdev.sig

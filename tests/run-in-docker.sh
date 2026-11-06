@@ -4,15 +4,13 @@
 set -eu
 cd "$(dirname "$0")/.."
 
-docker run --rm -v "$PWD:/src:ro" golang:1.25-bookworm bash -c '
+docker run --rm -v "$PWD:/src:ro" debian:12 bash -c '
   set -e
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq >/dev/null
-  apt-get install -y -qq --no-install-recommends qemu-utils python3 shellcheck tzdata >/dev/null 2>&1
+  apt-get install -y -qq --no-install-recommends qemu-utils python3 shellcheck tzdata whiptail curl procps ncurses-base >/dev/null 2>&1
   echo "== shellcheck"
-  shellcheck -S warning -x /src/app/rootfs_common/libexec/ugvm-backup.sh && echo "  ok   no warnings"
-  echo "== backend"
-  cp -r /src/app /tmp/app
-  (cd /tmp/app/backend && test -z "$(gofmt -l .)" && go vet ./... && go test -race -count=1 ./...)
-  bash /src/tests/script/run-tests.sh
+  shellcheck -S warning /src/ugvm-backup.sh
+  echo "  ok   no warnings"
+  bash /src/tests/run-tests.sh
 '

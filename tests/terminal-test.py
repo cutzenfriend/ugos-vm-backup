@@ -64,6 +64,18 @@ def finish():
     sys.exit(1)
 
 
+if len(sys.argv) > 2 and sys.argv[2] == "--startup":
+    if not wait_for("The schedule is not active"):
+        sys.exit(1)
+    send(ENTER)  # yes
+    if not wait_for("Schedule active."):
+        sys.exit(1)
+    send(ENTER)
+    if not wait_for("Schedule: active"):
+        sys.exit(1)
+    send(TAB + TAB + ENTER)
+    finish()
+
 if not wait_for("What do you want to do?"):
     sys.exit(1)
 print("MAIN-MENU-OK")

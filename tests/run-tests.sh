@@ -112,6 +112,10 @@ first_backup() { find "$(vm_dir "$1")" -mindepth 1 -maxdepth 1 -type d -name 'ba
 called() { grep -qE -- "$1" "$FAKE/calls"; }
 state_of() { sed -n "s/^$3=//p" "$BASE/ugvm-state/$1.$2"; }
 tui() { bash -c "source '$SCRIPT'; $1" >/tmp/last-output 2>&1 </dev/null; }
+# The interface asks about a missing schedule first. Most tests are about something
+# else, so they start with the schedule already active.
+schedule_on() { bash -c "source '$SCRIPT'; cron_install" >/dev/null 2>&1 </dev/null; }
+tui_main() { [[ ${1:-} == no-schedule ]] || schedule_on; tui 'tui_main'; }
 
 echo "== live backup"
 
@@ -618,7 +622,7 @@ cat >"$ANSWERS" <<'EOF'
 1
 0 exit
 EOF
-tui 'tui_main'
+tui_main
 check "job written" grep -q '^name=Nightly$' "$BASE/config.ini"
 check "VM selection written" grep -q '^vms=vm-a$' "$BASE/config.ini"
 check "start time written" grep -q '^at=04:15$' "$BASE/config.ini"
@@ -644,7 +648,7 @@ cat >"$ANSWERS" <<'EOF'
 1
 0 exit
 EOF
-tui 'tui_main'
+tui_main
 check "ALL becomes the wildcard" grep -q '^vms=\*$' "$BASE/config.ini"
 check "snapshot type written" grep -q '^type=snapshot$' "$BASE/config.ini"
 check "pausing is written" grep -q '^enabled=0$' "$BASE/config.ini"
@@ -666,14 +670,14 @@ cat >"$ANSWERS" <<'EOF'
 1
 0 exit
 EOF
-tui 'tui_main'
+tui_main
 check "invalid time not saved" test ! -e "$BASE/config.ini"
 check "user was told why" grep -q 'Invalid time' /tmp/whiptail-calls
 
 begin "tui-cancel"
 new_vm vm-a running
 printf '0 jobs\n0 new\n0 Half done\n' >"$ANSWERS"
-tui 'tui_main'
+tui_main
 check "cancelling saves nothing" test ! -e "$BASE/config.ini"
 check "cancelling ends cleanly" test "$?" = 0
 
@@ -681,7 +685,7 @@ begin "tui-delete-job"
 new_vm vm-a running
 write_config "$(job one backup vm-a)" "$(job two backup vm-a)"
 printf '0 jobs\n0 0\n0 delete\n0\n1\n0 exit\n' >"$ANSWERS"
-tui 'tui_main'
+tui_main
 refute "deleted job gone" grep -q '^id=one$' "$BASE/config.ini"
 check "other job kept" grep -q '^id=two$' "$BASE/config.ini"
 
@@ -691,24 +695,45 @@ write_config "$(job nightly backup vm-a)"
 now_job nightly
 dir=$(first_backup vm-a)
 printf '0 backups\n0 0\n0 ova\n0\n0\n1\n0 exit\n' >"$ANSWERS"
-tui 'tui_main'
+tui_main
 check "OVA created from the backup list" test -s "$dir/vm.ova"
 printf '0 backups\n0 0\n0 delete\n0\n1\n0 exit\n' >"$ANSWERS"
-tui 'tui_main'
+tui_main
 check "backup deleted from the list" test ! -e "$dir"
 
-begin "tui-cron"
-printf '0 cron\n0\n0\n0 exit\n' >"$ANSWERS"
-tui 'tui_main'
+begin "tui-startup-offer"
+printf '0\n0\n0 exit\n' >"$ANSWERS"
+tui_main no-schedule
+check "start offers a missing schedule" grep -q 'The schedule is not active' /tmp/whiptail-calls
+check "accepting adds the cron line" grep -q "$SCRIPT --run" /tmp/fake-crontab
+check "menu then says it is active" grep -q 'Schedule: active' /tmp/whiptail-calls
+
+begin "tui-startup-decline"
+printf '1\n0 exit\n' >"$ANSWERS"
+tui_main no-schedule
+check "declining adds nothing" test ! -e /tmp/fake-crontab
+check "menu says it is not active" grep -q 'Schedule: NOT active' /tmp/whiptail-calls
+
+begin "tui-startup-already-active"
+printf '0 exit\n' >"$ANSWERS"
+tui_main
+refute "no question when the schedule is active" grep -q 'The schedule is not active' /tmp/whiptail-calls
+
+begin "tui-cron-menu"
+printf '1\n0 cron\n0\n0\n0 exit\n' >"$ANSWERS"
+tui_main no-schedule
 check "schedule turned on from the menu" grep -q "$SCRIPT --run" /tmp/fake-crontab
+printf '0 cron\n0\n0\n0 exit\n' >"$ANSWERS"
+tui_main
+check "schedule turned off from the menu" test "$(grep -c "$SCRIPT" /tmp/fake-crontab)" = 0
 
 begin "tui-status"
 new_vm vm-a running
 touch "$FAKE/freeze-fails"
 write_config "$(job nightly backup vm-a)"
 now_job nightly
-printf '0 status\n0\n0 exit\n' >"$ANSWERS"
-tui 'tui_main'
+printf '1\n0 status\n0\n0 exit\n' >"$ANSWERS"
+tui_main no-schedule
 check "status shows the VM" grep -q 'Test VM' /tmp/whiptail-calls
 check "status shows the problem" grep -q 'qemu-guest-agent' /tmp/whiptail-calls
 check "status warns about a missing schedule" grep -q 'NOT ACTIVE' /tmp/whiptail-calls
@@ -716,7 +741,7 @@ check "status warns about a missing schedule" grep -q 'NOT ACTIVE' /tmp/whiptail
 begin "tui-broken-config"
 printf 'garbage\n' >"$BASE/config.ini"
 printf '0\n0 jobs\n0\n0 exit\n' >"$ANSWERS"
-tui 'tui_main'
+tui_main
 check "broken config is explained" grep -q "config.ini can't be used" /tmp/whiptail-calls
 check "broken config is not overwritten" test "$(cat "$BASE/config.ini")" = garbage
 
@@ -739,6 +764,7 @@ echo "== real whiptail in a real terminal"
 rm -f /usr/sbin/whiptail
 begin "real-terminal"
 new_vm vm-a running
+schedule_on
 python3 /src/tests/terminal-test.py "$SCRIPT" >/tmp/tty.out 2>&1
 check "drives the real interface" test "$?" = 0
 check "main menu appears despite an unknown terminal type" grep -q 'MAIN-MENU-OK' /tmp/tty.out
@@ -749,7 +775,14 @@ check "default VM selection is parsed" grep -q '^vms=\*$' "$BASE/config.ini"
 check "that job is valid" grep -q 'valid jobs: 1' /tmp/last-output
 grep -q '^EXIT 0$' /tmp/tty.out || cat /tmp/tty.out
 
+begin "real-terminal-startup"
+python3 /src/tests/terminal-test.py "$SCRIPT" --startup >/tmp/tty.out 2>&1
+check "startup offer works in a real terminal" test "$?" = 0
+check "accepting it adds the cron line" grep -q "$SCRIPT --run" /tmp/fake-crontab
+grep -q '^EXIT 0$' /tmp/tty.out || cat /tmp/tty.out
+
 begin "real-terminal-long-text"
+schedule_on
 for number in $(seq 10 45); do
   new_vm "vm-$number" running
 done

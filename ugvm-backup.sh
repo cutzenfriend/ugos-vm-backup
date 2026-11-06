@@ -28,7 +28,7 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export LIBVIRT_DEFAULT_URI=qemu:///system
 umask 077
 
-readonly VERSION="2.0.0"
+readonly VERSION="2.0.1"
 readonly CONFIG_FORMAT=2
 readonly UPDATE_URL="${UGVM_UPDATE_URL:-https://raw.githubusercontent.com/cutzenfriend/ugos-vm-backup/main/ugvm-backup.sh}"
 readonly MAX_CONFIG_BYTES=65536
@@ -1440,6 +1440,17 @@ tui_cron() {
   fi
 }
 
+# Without the cron line, jobs silently never run, so this is checked on every start.
+tui_offer_schedule() {
+  cron_installed && return 0
+  wt --yesno "The schedule is not active, so jobs don't run on their own.\n\nAdd this line to root's crontab now? It runs every 10 minutes, and the script only acts when a job is due:\n\n$(cron_line)" 0 0 >/dev/null || return 0
+  if cron_install && cron_installed; then
+    tui_message "Schedule active."
+  else
+    tui_message "Could not change root's crontab. Add the line with: sudo crontab -e"
+  fi
+}
+
 tui_update() {
   if ! fetch_update; then
     tui_message "Update check failed: $LAST_ERROR"
@@ -1475,13 +1486,22 @@ tui_main() {
   load_config
   [[ -n $CONFIG_ERROR ]] && tui_message "config.ini can't be used: $CONFIG_ERROR\n\nFix or delete the file to change jobs here."
 
-  local choice
+  tui_offer_schedule
+
+  local choice schedule cron_action
   while :; do
-    choice=$(wt --menu "What do you want to do?" 0 0 0 \
+    if cron_installed; then
+      schedule="Schedule: active"
+      cron_action="Turn the schedule off"
+    else
+      schedule="Schedule: NOT active, jobs don't run on their own"
+      cron_action="Turn the schedule on"
+    fi
+    choice=$(wt --menu "$schedule\n\nWhat do you want to do?" 0 0 0 \
       status "Overview and problems" \
       jobs "Create and change backup jobs" \
       backups "Show backups, create OVAs" \
-      cron "Turn the schedule on or off" \
+      cron "$cron_action" \
       update "Check for a new version" \
       exit "Leave") || break
     case "$choice" in

@@ -18,8 +18,8 @@ This downloads the script and opens the interface. If your folder has a differen
 
 In the interface:
 
-1. **jobs** > **Create a job:** choose the VMs, the schedule and how long backups are kept.
-2. **cron:** turn on the schedule. It adds one line to root's crontab, which runs every 10 minutes. The script only acts when a job is due.
+1. Confirm the schedule when the script asks. It adds one line to root's crontab, which runs every 10 minutes, and only acts when a job is due. The script checks this on every start, and the main menu shows whether the schedule is active.
+2. **jobs** > **Create a job:** choose the VMs, the schedule and how long backups are kept.
 
 To open the interface again:
 

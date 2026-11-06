@@ -2,7 +2,9 @@
 
 Live backups of the VMs on a UGREEN NAS, from one script with a simple terminal interface. Running VMs are never shut down.
 
-> **Status:** Early version. The backup method worked by hand on a real NAS, where the VM was frozen for 87 ms and the OVA imported into the Virtual Machine app. The complete script has only run against a stubbed `virsh` so far. Try it with an unimportant VM first and test a restore.
+![Main menu of the terminal interface](screenshots/main-menu.png)
+
+> **Status:** Early version. The interface and self-update work on a real NAS, and the backup method worked there by hand, with the VM frozen for 87 ms and the OVA imported into the Virtual Machine app. A complete backup through the script has only run against a stubbed `virsh` so far. Try it with an unimportant VM first and test a restore.
 
 This is an independent project and is not affiliated with UGREEN.
 
@@ -20,6 +22,8 @@ In the interface:
 
 1. Confirm the schedule when the script asks. It adds one line to root's crontab, which runs every 10 minutes, and only acts when a job is due. The script checks this on every start, and the main menu shows whether the schedule is active.
 2. **jobs** > **Create a job:** choose the VMs, the schedule and how long backups are kept.
+
+![Dialog that adds the schedule to root's crontab](screenshots/schedule-setup.png)
 
 To open the interface again:
 
@@ -83,6 +87,8 @@ A backup folder only gets its final name once the copy is complete and checked.
 **Retention:** The count and age limits both apply, and 0 means no limit. The newest backup is never deleted, and nothing is deleted after a failed run. Only backups from the same job count, so snapshots you create manually in UGOS are left alone.
 
 **Schedule:** A new job first runs at its next scheduled time. After a failure, the next attempt comes an hour later at the earliest.
+
+![Choosing how often a job runs](screenshots/job-interval.png)
 
 ## Restoring
 

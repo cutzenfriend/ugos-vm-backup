@@ -50,7 +50,20 @@ sed -i '1d' /tmp/whiptail-answers
 printf '%b' "${line#* }" >&2
 exit "${line%% *}"
 EOF
-chmod 0755 /usr/sbin/cp /usr/sbin/crontab /usr/sbin/whiptail
+# The container has no btrfs, so the file system type and attributes are faked.
+cat >/usr/sbin/findmnt <<'EOF'
+#!/bin/sh
+if [ "$1" = "-no" ] && [ "$2" = "FSTYPE" ]; then
+  if [ -f /tmp/fakevirt/not-btrfs ]; then echo ext4; else echo btrfs; fi
+  exit 0
+fi
+exec /usr/bin/findmnt "$@"
+EOF
+cat >/usr/sbin/lsattr <<'EOF'
+#!/bin/sh
+if [ -f /tmp/fakevirt/nocow ]; then echo "---------------C------ $2"; else echo "---------------------- $2"; fi
+EOF
+chmod 0755 /usr/sbin/cp /usr/sbin/crontab /usr/sbin/whiptail /usr/sbin/findmnt /usr/sbin/lsattr
 id -u appuser >/dev/null 2>&1 || useradd -M appuser
 
 passed=0
@@ -59,6 +72,7 @@ current=""
 
 begin() {
   current=$1
+  rm -f /usr/sbin/qemu-img
   rm -rf "$FAKE" /volume1 /volume2 /tmp/pwned /tmp/secret-marker /tmp/fake-crontab /tmp/whiptail-calls "$ANSWERS" /.ugvm-clone
   mkdir -p "$FAKE" "$BASE" /volume2/@kvm
   chown appuser "$BASE"
@@ -617,6 +631,7 @@ cat >"$ANSWERS" <<'EOF'
 0 04:15
 0 5
 0 14
+1
 0
 0
 1
@@ -665,6 +680,7 @@ cat >"$ANSWERS" <<'EOF'
 0 99:99
 0 5
 0 14
+1
 0
 0
 1
@@ -758,6 +774,230 @@ refute "--check freezes nothing" called 'domfsfreeze'
 begin "non-interactive"
 "$SCRIPT" </dev/null >/tmp/last-output 2>&1
 check "without a terminal it prints help" grep -q -- '--run' /tmp/last-output
+
+echo "== readiness"
+
+begin "readiness-ok"
+new_vm vm-a running
+"$SCRIPT" --check >/tmp/last-output 2>&1
+check "a ready VM is reported as ready" grep -q 'ready for live backups' /tmp/last-output
+
+begin "readiness-not-btrfs"
+new_vm vm-a running
+touch "$FAKE/not-btrfs"
+"$SCRIPT" --check >/tmp/last-output 2>&1
+check "a disk outside btrfs is reported" grep -q 'is on ext4. Live backups need btrfs' /tmp/last-output
+refute "it is not called ready" grep -q 'ready for live backups' /tmp/last-output
+
+begin "readiness-nocow"
+new_vm vm-a running
+touch "$FAKE/nocow"
+"$SCRIPT" --check >/tmp/last-output 2>&1
+check "nodatacow is reported" grep -q 'nodatacow' /tmp/last-output
+
+begin "readiness-agent"
+new_vm vm-a running
+touch "$FAKE/freeze-fails"
+"$SCRIPT" --check >/tmp/last-output 2>&1
+check "a silent guest agent is reported" grep -q "guest agent doesn't answer" /tmp/last-output
+
+begin "readiness-powered-off"
+new_vm vm-a "shut off"
+touch "$FAKE/freeze-fails"
+"$SCRIPT" --check >/tmp/last-output 2>&1
+refute "a powered-off VM needs no guest agent" grep -q "guest agent" /tmp/last-output
+
+begin "readiness-in-status"
+new_vm vm-a running
+touch "$FAKE/not-btrfs"
+printf '0 status\n0\n0 exit\n' >"$ANSWERS"
+tui_main
+check "status shows the problem under the VM" grep -q 'Live backups need btrfs' /tmp/whiptail-calls
+
+begin "readiness-when-saving"
+new_vm vm-a running
+touch "$FAKE/not-btrfs"
+printf '0 jobs\n0 new\n0 Nightly\n0 backup\n0 vm-a\n0 24\n0 03:00\n0 3\n0 0\n1\n0\n1\n1\n0 exit\n' >"$ANSWERS"
+tui_main
+check "saving warns about the VM" grep -q "can't be backed up while they run" /tmp/whiptail-calls
+check "going back saves nothing" test ! -e "$BASE/config.ini"
+printf '0 jobs\n0 new\n0 Nightly\n0 backup\n0 vm-a\n0 24\n0 03:00\n0 3\n0 0\n1\n0\n0\n0\n1\n0 exit\n' >"$ANSWERS"
+tui_main
+check "saving anyway keeps the job" grep -q '^name=Nightly$' "$BASE/config.ini"
+
+echo "== compression and priority"
+
+begin "compression"
+new_vm vm-a "shut off"
+qemu-io -f qcow2 -c 'write -P 0x41 0 4M' /volume2/@kvm/vm-a/disk.qcow2 >/dev/null
+write_config "$(job nightly backup vm-a; printf '\ncompress=1')"
+now_job nightly
+dir=$(first_backup vm-a)
+check "backup is valid" qemu-img check -q -f qcow2 "$dir/sda.qcow2"
+check "zstd is used" grep -q '"compression-type": "zstd"' <(qemu-img info --output=json "$dir/sda.qcow2")
+check "clusters are compressed" grep -q '100.00% compressed' <(qemu-img check -f qcow2 "$dir/sda.qcow2")
+check "manifest notes compression" grep -q '^compressed=1$' "$dir/manifest.txt"
+check "content is unchanged" qemu-img compare -q -f qcow2 -F qcow2 /volume2/@kvm/vm-a/disk.qcow2 "$dir/sda.qcow2"
+"$SCRIPT" --ova "$dir" >/tmp/last-output 2>&1
+check "OVA from a compressed backup works" test -s "$dir/vm.ova"
+
+begin "no-compression-by-default"
+new_vm vm-a "shut off"
+write_config "$(job nightly backup vm-a)"
+now_job nightly
+check "manifest says uncompressed" grep -q '^compressed=0$' "$(first_backup vm-a)/manifest.txt"
+check "summary mentions nothing" bash -c "source '$SCRIPT'; load_config; job_summary 0 | grep -vq compressed"
+
+begin "compress-value"
+new_vm vm-a "shut off"
+write_config "$(job nightly backup vm-a; printf '\ncompress=yes')"
+"$SCRIPT" --check >/tmp/last-output 2>&1
+check "invalid compress value rejected" grep -q 'Invalid value for compress' /tmp/last-output
+
+current="priority"
+check "copies run with the lowest CPU priority" test "$(bash -c "source '$SOURCE_SCRIPT'; heavy nice")" = 19
+check "copies run with the lowest disk priority" grep -q 'best-effort: prio 7' <(bash -c "source '$SOURCE_SCRIPT'; heavy ionice")
+
+echo "== storage"
+
+begin "storage"
+new_vm vm-a "shut off"
+write_config "$(job nightly backup vm-a)"
+now_job nightly
+"$SCRIPT" --check >/tmp/last-output 2>&1
+check "free space shown" grep -q 'Free:' /tmp/last-output
+check "space used by backups shown" grep -q 'Used by backups:' /tmp/last-output
+check "space per VM shown" grep -q 'Test_VM-vm-a:' /tmp/last-output
+check "room for more backups estimated" grep -q 'Room for about' /tmp/last-output
+printf '0 status\n0\n0 exit\n' >"$ANSWERS"
+tui_main
+check "status shows storage" grep -q 'Used by backups' /tmp/whiptail-calls
+
+begin "storage-running-out"
+mkdir -p "$BASE/x/backup-a-20200101-030000"
+printf 'created=1577847600\nsize=900000000000000\n' >"$BASE/x/backup-a-20200101-030000/manifest.txt"
+"$SCRIPT" --check >/tmp/last-output 2>&1
+check "running out of space is reported" grep -q 'Not enough free space for the next backup' /tmp/last-output
+
+echo "== restore"
+
+# restore_setup <state>: makes a backup, then changes the disk and UEFI variables.
+restore_setup() {
+  new_vm vm-a "$1"
+  touch "$FAKE/vm-a/uefi"
+  echo old-nvram >"$FAKE/vm-a/nvram.bin"
+  qemu-io -f qcow2 -c 'write -P 0x41 0 1M' /volume2/@kvm/vm-a/disk.qcow2 >/dev/null
+  write_config "$(job nightly backup vm-a)"
+  now_job nightly
+  dir=$(first_backup vm-a)
+  qemu-io -f qcow2 -c 'write -P 0x42 0 1M' /volume2/@kvm/vm-a/disk.qcow2 >/dev/null
+  echo new-nvram >"$FAKE/vm-a/nvram.bin"
+  cp /volume2/@kvm/vm-a/disk.qcow2 /tmp/changed.qcow2
+  rm -f "$FAKE/calls"
+}
+disk_is_backup() { qemu-img compare -q -f qcow2 -F qcow2 "$dir/sda.qcow2" /volume2/@kvm/vm-a/disk.qcow2; }
+disk_unchanged() { qemu-img compare -q -f qcow2 -F qcow2 /tmp/changed.qcow2 /volume2/@kvm/vm-a/disk.qcow2; }
+kept_disks() { find /volume2/@kvm/vm-a -name 'disk.qcow2.before-restore-*' | wc -l; }
+
+begin "restore-running"
+restore_setup running
+"$SCRIPT" --restore "$dir" --yes >/tmp/last-output 2>&1
+check "restore succeeds" test "$?" = 0
+check "disk has the backup's content" disk_is_backup
+check "running VM was shut down" called '^shutdown'
+check "VM runs again afterwards" test "$(cat "$FAKE/vm-a/state")" = running
+check "previous disk is kept" test "$(kept_disks)" = 1
+check "kept disk has the newer content" qemu-img compare -q -f qcow2 -F qcow2 /tmp/changed.qcow2 /volume2/@kvm/vm-a/disk.qcow2.before-restore-*
+check "UEFI variables restored" test "$(cat "$FAKE/vm-a/nvram.bin")" = old-nvram
+check "previous UEFI variables kept" test "$(cat "$FAKE"/vm-a/nvram.bin.before-restore-*)" = new-nvram
+check "kept files are listed" grep -q 'before-restore' /tmp/last-output
+check "restore logged" grep -q 'Restored VM vm-a' "$BASE/ugvm-backup.log"
+refute "VM never forced off" called '^destroy'
+
+begin "restore-stopped"
+restore_setup "shut off"
+"$SCRIPT" --restore "$dir" --yes >/tmp/last-output 2>&1
+check "disk has the backup's content" disk_is_backup
+refute "stopped VM is not shut down" called '^shutdown'
+refute "stopped VM stays off" called '^start'
+
+begin "restore-asks-first"
+restore_setup running
+"$SCRIPT" --restore "$dir" </dev/null >/tmp/last-output 2>&1
+check "refuses without confirmation" test "$?" = 1
+check "disk unchanged without confirmation" disk_unchanged
+refute "VM untouched without confirmation" called '^shutdown'
+
+begin "restore-snapshots"
+restore_setup running
+mkdir -p "$FAKE/vm-a/snapshots"
+printf 'manual\n1000\n' >"$FAKE/vm-a/snapshots/vm-a_1000"
+"$SCRIPT" --restore "$dir" --yes >/tmp/last-output 2>&1
+check "refused while the VM has snapshots" grep -q 'snapshot' /tmp/last-output
+check "disk unchanged" disk_unchanged
+refute "VM not shut down" called '^shutdown'
+
+begin "restore-vm-gone"
+restore_setup "shut off"
+rm -rf "${FAKE:?}/vm-a"
+"$SCRIPT" --restore "$dir" --yes >/tmp/last-output 2>&1
+check "missing VM points to the OVA" grep -q 'no longer exists. Create an OVA' /tmp/last-output
+
+begin "restore-damaged-backup"
+restore_setup running
+printf 'garbage garbage garbage' | dd of="$dir/sda.qcow2" bs=1 conv=notrunc status=none
+"$SCRIPT" --restore "$dir" --yes >/tmp/last-output 2>&1
+check "damaged backup refused" grep -q 'is damaged' /tmp/last-output
+check "disk unchanged" disk_unchanged
+refute "VM not shut down for a damaged backup" called '^shutdown'
+
+begin "restore-mismatch"
+restore_setup "shut off"
+cp "$dir/sda.qcow2" "$dir/sdb.qcow2"
+"$SCRIPT" --restore "$dir" --yes >/tmp/last-output 2>&1
+check "backup with other disks refused" grep -q "don't match" /tmp/last-output
+check "disk unchanged" disk_unchanged
+
+begin "restore-shutdown-timeout"
+restore_setup running
+touch "$FAKE/refuses-shutdown"
+UGVM_SHUTDOWN_TIMEOUT=2 "$SCRIPT" --restore "$dir" --yes >/tmp/last-output 2>&1
+check "timeout reported" grep -q 'did not shut down' /tmp/last-output
+check "disk unchanged" disk_unchanged
+check "nothing moved aside" test "$(kept_disks)" = 0
+refute "VM never forced off" called '^destroy'
+
+begin "restore-copy-fails"
+restore_setup running
+cat >/usr/sbin/qemu-img <<'EOF'
+#!/bin/sh
+[ "$1" = convert ] && { echo "qemu-img: simulated failure" >&2; exit 1; }
+exec /usr/bin/qemu-img "$@"
+EOF
+chmod 0755 /usr/sbin/qemu-img
+"$SCRIPT" --restore "$dir" --yes >/tmp/last-output 2>&1
+rm -f /usr/sbin/qemu-img
+check "failure reported" grep -q 'previous disks are back in place' /tmp/last-output
+check "previous disk is back" disk_unchanged
+check "nothing left aside" test "$(kept_disks)" = 0
+check "VM runs again after the failure" test "$(cat "$FAKE/vm-a/state")" = running
+
+begin "restore-from-menu"
+restore_setup running
+schedule_on
+printf '0 backups\n0 0\n0 restore\n0\n0\n1\n0 exit\n' >"$ANSWERS"
+tui 'tui_main'
+check "restore from the backup list works" disk_is_backup
+check "menu asked before restoring" grep -q 'will be shut down, restored and started again' /tmp/whiptail-calls
+check "menu lists the kept files" grep -q 'before-restore' /tmp/whiptail-calls
+
+begin "restore-cancelled-in-menu"
+restore_setup running
+schedule_on
+printf '0 backups\n0 0\n0 restore\n1\n1\n0 exit\n' >"$ANSWERS"
+tui 'tui_main'
+check "cancelling keeps the disk" disk_unchanged
+refute "cancelling keeps the VM running" called '^shutdown'
 
 echo "== real whiptail in a real terminal"
 

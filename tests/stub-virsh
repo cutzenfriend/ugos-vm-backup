@@ -94,6 +94,16 @@ case "$command" in
     rm -f "$dir/frozen"
     echo "Thawed 1 filesystem(s)"
     ;;
+  shutdown)
+    require_vm
+    touch "$dir/was-shutdown"
+    [[ -f $ROOT/refuses-shutdown ]] || echo "shut off" >"$dir/state"
+    ;;
+  start)
+    require_vm
+    touch "$dir/was-started"
+    echo running >"$dir/state"
+    ;;
   snapshot-create-as)
     require_vm
     [[ -f $ROOT/snapshot-fails ]] && { echo "error: internal snapshot not supported" >&2; exit 1; }
@@ -120,7 +130,7 @@ case "$command" in
     rm -f "$dir/snapshots/$snapshot"
     ;;
   *)
-    # shutdown, destroy, start and everything else must never be called.
+    # destroy and everything else must never be called.
     echo "stub-virsh: unexpected command $command" >&2
     exit 64
     ;;

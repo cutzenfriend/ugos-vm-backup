@@ -36,7 +36,7 @@ sudo bash /volume1/VMBackup/ugvm-backup.sh
 - `qemu-guest-agent` running inside each VM you back up while it runs
 - `whiptail` and `curl`, which were already on the NAS this was tested on
 
-`--check` shows whether your NAS and VMs meet these requirements. It changes nothing:
+`--check` shows whether your NAS and VMs meet these requirements, and how much space is left. It changes nothing. The status page in the interface shows the same, and saving a job warns about VMs that can't be backed up while they run.
 
 ```bash
 sudo bash /volume1/VMBackup/ugvm-backup.sh --check
@@ -52,6 +52,8 @@ sudo bash /volume1/VMBackup/ugvm-backup.sh --check
 A powered-off VM is copied directly. If a running VM can't be frozen or its disk can't be cloned, the job fails with an error. The script doesn't fall back to copying a disk in use, because that can produce a damaged backup.
 
 A frozen backup is as clean as a file system after a sync. Databases inside the VM may run their normal recovery when restored.
+
+Copies run with the lowest CPU and disk priority, so other services on the NAS keep their speed. A backup takes longer when the NAS is busy.
 
 ## Files
 
@@ -84,6 +86,8 @@ A backup folder only gets its final name once the copy is complete and checked.
 
 **Retention:** The count and age limits both apply, and 0 means no limit. The newest backup is never deleted, and nothing is deleted after a failed run. Only backups from the same job count, so snapshots you create manually in UGOS are left alone.
 
+**Compression:** Each backup job can compress its backups with zstd. This saves space, especially for disks with a lot of text or free space, but copying takes longer.
+
 **Schedule:** A new job first runs at its next scheduled time. After a failure, the next attempt comes an hour later at the earliest.
 
 ![Choosing how often a job runs](screenshots/job-interval.png)
@@ -92,13 +96,14 @@ A backup folder only gets its final name once the copy is complete and checked.
 
 **As a new VM:** Under **backups**, choose a backup and then **Create OVA for importing**. Import `vm.ova` in the Virtual Machine app. Disconnect the network before the first start if the original VM is still running, because the copy has the same hostname and services.
 
-**Over an existing VM:** With the VM powered off, copy the disk back:
+**Over the existing VM:** Under **backups**, choose a backup and then **Put this backup back onto the VM**. The script:
 
-```bash
-sudo cp <backup>/sda.qcow2 <disk-path-from-virsh-domblklist>
-```
+1. Checks the backup and the free space while the VM keeps running.
+2. Shuts the VM down if it is running. Restoring is the one action that has to.
+3. Moves the current disks aside, copies the backup in their place and restores the UEFI variables.
+4. Starts the VM again if it was running.
 
-This overwrites the VM's current disk, including its UGOS snapshots.
+The previous disks stay next to the new ones with the ending `.before-restore-<time>` until you delete them. If anything fails, the previous disks are put back. The script refuses to restore a VM that has snapshots, because they would no longer work, so delete them in UGOS first or import an OVA as a new VM instead.
 
 ## Commands
 
@@ -107,6 +112,7 @@ This overwrites the VM's current disk, including its UGOS snapshots.
 | `--run` | Runs what is due, for cron |
 | `--now JOB` | Runs one job immediately |
 | `--ova BACKUP_DIR` | Creates an OVA from a backup, even if the VM no longer exists |
+| `--restore BACKUP_DIR [--yes]` | Puts a backup back onto its VM |
 | `--check` | Shows what the script finds on this NAS |
 | `--update [--yes]` | Updates the script from GitHub |
 | `--version` | Shows the version |

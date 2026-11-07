@@ -116,6 +116,8 @@ wait_for("Keep at most this many")
 send(ENTER)
 wait_for("for at most this many days")
 send(ENTER)
+wait_for("Compress the backups?")
+send(ENTER)  # the default, no
 wait_for("Run this job on its schedule?")
 send(ENTER)  # yes
 wait_for("Job saved")

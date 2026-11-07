@@ -10,12 +10,13 @@
 #   ugvm-backup.sh --run              run what is due (for cron)
 #   ugvm-backup.sh --now JOB          run one job immediately
 #   ugvm-backup.sh --ova BACKUP_DIR   create an OVA from an existing backup
+#   ugvm-backup.sh --restore BACKUP_DIR [--yes]   put a backup back onto its VM
 #   ugvm-backup.sh --check            show what the script finds on this NAS
 #   ugvm-backup.sh --update [--yes]   update this script from GitHub
 #   ugvm-backup.sh --version
 #
-# A running VM is never shut down. The guest agent freezes its file systems for a
-# moment, btrfs clones the disk, the VM continues, and the clone is copied at leisure.
+# A backup never shuts a running VM down. The guest agent freezes its file systems
+# for a moment, btrfs clones the disk, the VM continues, and the clone is copied.
 
 set -u
 set -o pipefail
@@ -28,7 +29,7 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export LIBVIRT_DEFAULT_URI=qemu:///system
 umask 077
 
-readonly VERSION="2.0.1"
+readonly VERSION="2.1.0"
 readonly CONFIG_FORMAT=2
 readonly UPDATE_URL="${UGVM_UPDATE_URL:-https://raw.githubusercontent.com/cutzenfriend/ugos-vm-backup/main/ugvm-backup.sh}"
 readonly MAX_CONFIG_BYTES=65536
@@ -36,6 +37,9 @@ readonly MAX_JOBS=32
 readonly MAX_NAME_LENGTH=64
 readonly RETRY_AFTER_SECONDS=3600
 readonly CLONE_TIMEOUT_SECONDS=60
+SHUTDOWN_TIMEOUT_SECONDS=${UGVM_SHUTDOWN_TIMEOUT:-300}
+[[ $SHUTDOWN_TIMEOUT_SECONDS =~ ^[0-9]{1,5}$ ]] || SHUTDOWN_TIMEOUT_SECONDS=300
+readonly SHUTDOWN_TIMEOUT_SECONDS
 readonly LOCK_FILE=/run/ugvm-backup.lock
 
 readonly RE_JOB_ID='^[a-z0-9][a-z0-9-]{0,31}$'
@@ -74,6 +78,17 @@ DISK_TARGETS=()
 DISK_PATHS=()
 DISK_FORMATS=()
 CONSISTENCY=""
+COMPRESSION_TYPE=""
+PROBLEMS=()
+RESTORE_ACTIVE=0
+RESTORE_DIR=""
+RESTORE_VM=""
+RESTORE_STATE=""
+RESTORE_WAS_RUNNING=0
+RESTORE_WARNING=""
+RESTORE_MOVED=()
+RESTORE_OLD=()
+RESTORE_KEPT=()
 
 # --- Logging and small helpers ------------------------------------------------
 
@@ -184,7 +199,7 @@ parse_config() {
       version)
         version=$value
         ;;
-      id | name | type | enabled | interval_hours | at | vms | keep_count | keep_days)
+      id | name | type | enabled | interval_hours | at | vms | keep_count | keep_days | compress)
         if ((index < 0)); then
           CONFIG_ERROR="Invalid line $number in config.ini"
           return 1
@@ -235,6 +250,11 @@ validate_job() {
     0 | 1) ;;
     *) fail "Invalid value for enabled"; return 1 ;;
   esac
+  JOB["$index.compress"]=${JOB["$index.compress"]:-0}
+  case "${JOB["$index.compress"]}" in
+    0 | 1) ;;
+    *) fail "Invalid value for compress"; return 1 ;;
+  esac
   if ((${#name} > MAX_NAME_LENGTH)) || [[ $name =~ [[:cntrl:]] ]]; then
     fail "Invalid name"
     return 1
@@ -272,7 +292,7 @@ save_config() {
     printf '# Managed by ugvm-backup.\nversion=%s\n' "$CONFIG_FORMAT"
     for index in "${JOB_INDEXES[@]+"${JOB_INDEXES[@]}"}"; do
       printf '\n[job]\n'
-      for key in id name type enabled interval_hours at vms keep_count keep_days; do
+      for key in id name type enabled interval_hours at vms keep_count keep_days compress; do
         printf '%s=%s\n' "$key" "${JOB["$index.$key"]:-}"
       done
     done
@@ -445,6 +465,28 @@ run_long() {
   return "$code"
 }
 
+# Copies run with the lowest CPU and disk priority, so other services on the NAS
+# keep their speed. A backup then takes longer when the NAS is busy.
+heavy() {
+  local prefix=()
+  command -v nice >/dev/null 2>&1 && prefix+=(nice -n 19)
+  command -v ionice >/dev/null 2>&1 && prefix+=(ionice -c 2 -n 7)
+  "${prefix[@]}" "$@"
+}
+
+# zstd is faster than zlib at a similar ratio, but needs qemu-img 5.1 or newer.
+detect_compression() {
+  [[ -n $COMPRESSION_TYPE ]] && return 0
+  local probe
+  probe=$(new_private_file) || { COMPRESSION_TYPE=zlib; return 0; }
+  TMP_FILES+=("$probe")
+  if qemu-img create -q -f qcow2 -o compression_type=zstd "$probe" 1M >/dev/null 2>&1; then
+    COMPRESSION_TYPE=zstd
+  else
+    COMPRESSION_TYPE=zlib
+  fi
+}
+
 # --- VM information -----------------------------------------------------------
 
 vm_state() { virsh domstate --domain "$1" 2>/dev/null | head -n 1; }
@@ -591,18 +633,23 @@ discard_clones() {
 }
 
 copy_disks() {
-  local dest=$1 index source
+  local dest=$1 compress=${2:-0} index source options=()
+  if [[ $compress == 1 ]]; then
+    detect_compression
+    options=(-c)
+    [[ $COMPRESSION_TYPE == zstd ]] && options+=(-o compression_type=zstd)
+  fi
   for index in "${!DISK_TARGETS[@]}"; do
     source=${DISK_PATHS[$index]}
     [[ -n ${CLONE_PATHS[$index]:-} ]] && source=${CLONE_PATHS[$index]}
     log_verbose "Copying disk ${DISK_TARGETS[$index]}"
-    run_long qemu-img convert -f "${DISK_FORMATS[$index]}" -O qcow2 \
+    run_long heavy qemu-img convert -f "${DISK_FORMATS[$index]}" -O qcow2 "${options[@]}" \
       -- "$source" "$dest/${DISK_TARGETS[$index]}.qcow2" || {
       fail "Could not copy disk ${DISK_TARGETS[$index]}: $LAST_ERROR"
       return 1
     }
     log_verbose "Checking disk ${DISK_TARGETS[$index]}"
-    run_long qemu-img check -f qcow2 -- "$dest/${DISK_TARGETS[$index]}.qcow2" || {
+    run_long heavy qemu-img check -f qcow2 -- "$dest/${DISK_TARGETS[$index]}.qcow2" || {
       fail "Check of disk ${DISK_TARGETS[$index]} failed: $LAST_ERROR"
       return 1
     }
@@ -699,7 +746,7 @@ backup_vm() {
       ;;
   esac
 
-  copy_disks "$STAGING" || return 1
+  copy_disks "$STAGING" "${JOB["$index.compress"]:-0}" || return 1
   discard_clones
   copy_vm_metadata "$vm" "$STAGING" || return 1
 
@@ -707,7 +754,8 @@ backup_vm() {
   size=$(du -sB1 -- "$STAGING" | cut -f1)
   {
     printf 'format=2\nid=%s\njob=%s\ntype=backup\nvm=%s\ntitle=%s\n' "$name" "$job" "$vm" "$title"
-    printf 'created=%s\nconsistency=%s\nsize=%s\nscript_version=%s\n' "$now" "$CONSISTENCY" "$size" "$VERSION"
+    printf 'created=%s\nconsistency=%s\nsize=%s\ncompressed=%s\nscript_version=%s\n' \
+      "$now" "$CONSISTENCY" "$size" "${JOB["$index.compress"]:-0}" "$VERSION"
   } >"$STAGING/manifest.txt"
 
   find -P "$STAGING" -type d -exec chmod 0750 {} +
@@ -939,7 +987,7 @@ build_ova() {
 
   for target in "${targets[@]}"; do
     log_verbose "Converting disk $target"
-    run_long qemu-img convert -f qcow2 -O vmdk -o subformat=streamOptimized \
+    run_long heavy qemu-img convert -f qcow2 -O vmdk -o subformat=streamOptimized \
       -- "$dir/$target.qcow2" "$STAGING/$target.vmdk" || {
       fail "OVA conversion failed: $LAST_ERROR"
       return 1
@@ -961,7 +1009,7 @@ build_ova() {
   ) || { fail "Could not create checksums"; return 1; }
 
   # The OVF specification requires the descriptor to be the first file.
-  run_long tar --format=ustar -C "$STAGING" -cf "$STAGING/vm.ova" -- vm.ovf vm.mf "${files[@]}" || {
+  run_long heavy tar --format=ustar -C "$STAGING" -cf "$STAGING/vm.ova" -- vm.ovf vm.mf "${files[@]}" || {
     fail "Could not create the OVA archive: $LAST_ERROR"
     return 1
   }
@@ -971,6 +1019,251 @@ build_ova() {
   discard_staging
   log_event info "OVA created: ${dir##*/}"
   LAST_OVA="$dir/vm.ova"
+}
+
+# --- Readiness ----------------------------------------------------------------
+
+# Fills PROBLEMS with what prevents a live backup of this VM. A powered-off VM can
+# still be backed up without btrfs or a guest agent.
+vm_problems() {
+  local vm=$1 index fs attrs
+  PROBLEMS=()
+  if ! load_disks "$vm"; then
+    PROBLEMS+=("$LAST_ERROR")
+    return 0
+  fi
+  for index in "${!DISK_TARGETS[@]}"; do
+    fs=$(findmnt -no FSTYPE -T "${DISK_PATHS[$index]}" 2>/dev/null | head -n 1)
+    if [[ $fs != btrfs ]]; then
+      PROBLEMS+=("Disk ${DISK_TARGETS[$index]} is on ${fs:-an unknown file system}. Live backups need btrfs.")
+    fi
+    attrs=$(lsattr -- "${DISK_PATHS[$index]}" 2>/dev/null | cut -d' ' -f1)
+    if [[ $attrs == *C* ]]; then
+      PROBLEMS+=("Disk ${DISK_TARGETS[$index]} has nodatacow set and can't be cloned.")
+    fi
+  done
+  if [[ $(vm_state "$vm") == running ]] && ! virsh domfsinfo --domain "$vm" >/dev/null 2>&1; then
+    PROBLEMS+=("The guest agent doesn't answer. Is qemu-guest-agent running inside the VM?")
+  fi
+  return 0
+}
+
+# --- Storage ------------------------------------------------------------------
+
+storage_text() {
+  local free folder size total=0 need=0 lines="" dir created newest newest_size
+  free=$(df --output=avail -B1 -- "$BASE_DIR" 2>/dev/null | tail -n 1 | tr -d ' ')
+  [[ $free =~ $RE_BYTES ]] || free=0
+  for folder in "$BASE_DIR"/*/; do
+    folder=${folder%/}
+    [[ -L $folder ]] && continue
+    compgen -G "$folder/backup-*" >/dev/null || continue
+    size=$(du -sB1 -- "$folder" 2>/dev/null | cut -f1)
+    [[ $size =~ $RE_BYTES ]] || size=0
+    total=$((total + size))
+    newest=0
+    newest_size=0
+    for dir in "$folder"/backup-*; do
+      [[ -d $dir && ! -L $dir ]] || continue
+      created=$(manifest_value "$dir/manifest.txt" created)
+      [[ $created =~ $RE_EPOCH ]] || continue
+      if ((created > newest)); then
+        newest=$created
+        newest_size=$(manifest_value "$dir/manifest.txt" size)
+        [[ $newest_size =~ $RE_BYTES ]] || newest_size=0
+      fi
+    done
+    need=$((need + newest_size))
+    lines+="  $(safe_text "${folder##*/}"): $(format_size "$size")"$'\n'
+  done
+
+  printf 'Storage\n  Free: %s\n  Used by backups: %s\n%s' "$(format_size "$free")" "$(format_size "$total")" "$lines"
+  if ((need > 0)); then
+    if ((free < need + need / 10)); then
+      printf '  ! Not enough free space for the next backup of every VM (about %s).\n' "$(format_size "$need")"
+    else
+      printf '  Room for about %s more backups of every VM\n' "$((free / need))"
+    fi
+  fi
+}
+
+# --- Restore ------------------------------------------------------------------
+
+# Checks everything that can be checked while the VM keeps running, so a problem
+# never leaves a VM shut down for nothing.
+restore_prepare() {
+  local dir=$1 vm file target index found count compressed size available
+  RESTORE_DIR=""
+  RESTORE_VM=""
+  [[ -d $dir && ! -L $dir && -f $dir/manifest.txt ]] || { fail "This is not a complete backup"; return 1; }
+  dir=$(realpath -e -- "$dir")
+  vm=$(manifest_value "$dir/manifest.txt" vm)
+  [[ $vm =~ $RE_VM_ID ]] || { fail "The backup doesn't name its VM"; return 1; }
+  load_vm_list
+  if ! vm_known "$vm"; then
+    fail "This VM no longer exists. Create an OVA from the backup and import it as a new VM."
+    return 1
+  fi
+  load_disks "$vm" || return 1
+
+  count=$(virsh snapshot-list --domain "$vm" --name 2>/dev/null | grep -c .)
+  if ((count > 0)); then
+    fail "This VM has $count snapshot(s), which restoring would break. Delete them in UGOS first, or create an OVA from the backup and import it as a new VM."
+    return 1
+  fi
+
+  for file in "$dir"/*.qcow2; do
+    [[ -f $file && ! -L $file ]] || continue
+    target=${file##*/}
+    target=${target%.qcow2}
+    found=0
+    for index in "${!DISK_TARGETS[@]}"; do
+      [[ ${DISK_TARGETS[$index]} == "$target" ]] && found=1
+    done
+    ((found == 1)) || { fail "The backup's disks don't match the VM's current disks"; return 1; }
+  done
+
+  compressed=$(manifest_value "$dir/manifest.txt" compressed)
+  for index in "${!DISK_TARGETS[@]}"; do
+    file="$dir/${DISK_TARGETS[$index]}.qcow2"
+    [[ -f $file && ! -L $file ]] || { fail "The backup's disks don't match the VM's current disks"; return 1; }
+    log_verbose "Checking the backup of disk ${DISK_TARGETS[$index]}"
+    run_long heavy qemu-img check -f qcow2 -- "$file" || {
+      fail "The backup of disk ${DISK_TARGETS[$index]} is damaged: $LAST_ERROR"
+      return 1
+    }
+    if [[ $compressed == 1 ]]; then
+      size=$(qemu-img info -f qcow2 --output=json -- "$file" | sed -n 's/.*"virtual-size": *\([0-9]*\).*/\1/p' | head -n 1)
+    else
+      size=$(du -sB1 -- "$file" | cut -f1)
+    fi
+    [[ $size =~ $RE_BYTES ]] || size=0
+    available=$(df --output=avail -B1 -- "${DISK_PATHS[$index]%/*}" 2>/dev/null | tail -n 1 | tr -d ' ')
+    if [[ $available =~ $RE_BYTES ]] && ((available < size + size / 10)); then
+      fail "Not enough space next to disk ${DISK_TARGETS[$index]}: $((available / 1073741824)) GiB free, about $((size / 1073741824)) GiB needed"
+      return 1
+    fi
+  done
+
+  RESTORE_STATE=$(vm_state "$vm")
+  case "$RESTORE_STATE" in
+    running | "shut off") ;;
+    *) fail "VM is in state ${RESTORE_STATE:-unknown}"; return 1 ;;
+  esac
+  RESTORE_DIR=$dir
+  RESTORE_VM=$vm
+}
+
+# Puts the previous disks back. Used when a restore fails or is interrupted.
+restore_rollback() {
+  local index
+  for ((index = ${#RESTORE_MOVED[@]} - 1; index >= 0; index--)); do
+    rm -f -- "${RESTORE_MOVED[$index]}"
+    mv -f -- "${RESTORE_OLD[$index]}" "${RESTORE_MOVED[$index]}" ||
+      log_event error "Could not move ${RESTORE_OLD[$index]} back"
+  done
+  RESTORE_MOVED=()
+  RESTORE_OLD=()
+  RESTORE_ACTIVE=0
+  if ((RESTORE_WAS_RUNNING == 1)); then
+    virsh start --domain "$RESTORE_VM" >/dev/null 2>&1 || log_event error "Could not start VM $RESTORE_VM again"
+  fi
+  return 0
+}
+
+# The previous disks stay next to the new ones until the user deletes them.
+restore_run() {
+  local vm=$RESTORE_VM dir=$RESTORE_DIR stamp index path old waited=0 error xml nvram
+  stamp=$(date +%Y%m%d-%H%M%S)
+  RESTORE_WAS_RUNNING=0
+  RESTORE_WARNING=""
+  RESTORE_MOVED=()
+  RESTORE_OLD=()
+  RESTORE_KEPT=()
+
+  if [[ $RESTORE_STATE == running ]]; then
+    log_verbose "Shutting down the VM"
+    virsh shutdown --domain "$vm" >/dev/null 2>&1 || { fail "Could not shut down the VM. Nothing was changed."; return 1; }
+    while [[ $(vm_state "$vm") != "shut off" ]]; do
+      if ((waited >= SHUTDOWN_TIMEOUT_SECONDS)); then
+        fail "The VM did not shut down within $((SHUTDOWN_TIMEOUT_SECONDS / 60)) minutes. Nothing was changed. If it shuts down later, start it again in UGOS."
+        return 1
+      fi
+      /bin/sleep 2
+      waited=$((waited + 2))
+    done
+    RESTORE_WAS_RUNNING=1
+  fi
+
+  RESTORE_ACTIVE=1
+  for index in "${!DISK_TARGETS[@]}"; do
+    path=${DISK_PATHS[$index]}
+    old="$path.before-restore-$stamp"
+    if ! mv -- "$path" "$old"; then
+      restore_rollback
+      fail "Could not move disk ${DISK_TARGETS[$index]} aside. Nothing was changed."
+      return 1
+    fi
+    RESTORE_MOVED+=("$path")
+    RESTORE_OLD+=("$old")
+    log_verbose "Restoring disk ${DISK_TARGETS[$index]}"
+    if ! run_long heavy qemu-img convert -f qcow2 -O "${DISK_FORMATS[$index]}" -- "$dir/${DISK_TARGETS[$index]}.qcow2" "$path"; then
+      error=$LAST_ERROR
+      restore_rollback
+      fail "Could not restore disk ${DISK_TARGETS[$index]}: $error. The previous disks are back in place."
+      return 1
+    fi
+    chown --reference="$old" -- "$path" 2>/dev/null
+    chmod --reference="$old" -- "$path" 2>/dev/null
+  done
+  RESTORE_KEPT=("${RESTORE_OLD[@]}")
+
+  xml=$(virsh dumpxml --inactive --domain "$vm" 2>/dev/null)
+  nvram=$(sed -n 's/.*<nvram[^>]*>\([^<]*\)<\/nvram>.*/\1/p' <<<"$xml" | head -n 1)
+  if [[ -f $dir/nvram.fd && $nvram == /* && -f $nvram && ! -L $nvram ]]; then
+    old="$nvram.before-restore-$stamp"
+    if cp -p -- "$nvram" "$old" && cp -- "$dir/nvram.fd" "$nvram.new" &&
+      chown --reference="$old" -- "$nvram.new" && chmod --reference="$old" -- "$nvram.new" &&
+      mv -f -- "$nvram.new" "$nvram"; then
+      RESTORE_KEPT+=("$old")
+    else
+      rm -f -- "$nvram.new"
+      RESTORE_WARNING="The UEFI variables could not be restored, the VM keeps its current ones."
+    fi
+  fi
+  RESTORE_MOVED=()
+  RESTORE_OLD=()
+  RESTORE_ACTIVE=0
+
+  if ((RESTORE_WAS_RUNNING == 1)); then
+    log_verbose "Starting the VM"
+    virsh start --domain "$vm" >/dev/null 2>&1 ||
+      RESTORE_WARNING+="${RESTORE_WARNING:+ }The VM could not be started. Start it in UGOS."
+  fi
+  log_event info "Restored VM $vm from ${dir##*/}"
+  return 0
+}
+
+cli_restore() {
+  local dir=$1 assume_yes=$2 answer path
+  acquire_lock || { printf 'Another backup is running.\n' >&2; return 1; }
+  VERBOSE=1
+  restore_prepare "$dir" || { printf "Can't restore: %s\n" "$LAST_ERROR" >&2; return 1; }
+  printf 'Restore VM %s from %s.\n' "$(vm_label "$RESTORE_VM")" "${RESTORE_DIR##*/}"
+  [[ $RESTORE_STATE == running ]] && printf 'The VM is running. It will be shut down, restored and started again.\n'
+  printf 'Everything that changed inside the VM since this backup will be lost.\n'
+  if ((assume_yes == 0)); then
+    [[ -t 0 ]] || { printf 'Run again with --yes to restore.\n'; return 1; }
+    read -r -p 'Restore now? [y/N] ' answer
+    [[ $answer == [yY]* ]] || { printf 'Nothing changed.\n'; return 0; }
+  fi
+  restore_run || { printf 'Restore failed: %s\n' "$LAST_ERROR" >&2; return 1; }
+  printf 'Restored. The previous files are kept until you delete them:\n'
+  for path in "${RESTORE_KEPT[@]}"; do
+    printf '  %s\n' "$path"
+  done
+  [[ -n $RESTORE_WARNING ]] && printf '%s\n' "$RESTORE_WARNING"
+  return 0
 }
 
 # --- Backups on disk ----------------------------------------------------------
@@ -1139,6 +1432,7 @@ job_summary() {
   retention="${JOB["$index.keep_count"]} kept"
   [[ ${JOB["$index.keep_count"]} == 0 ]] && retention="no count limit"
   [[ ${JOB["$index.keep_days"]} != 0 ]] && retention+=", ${JOB["$index.keep_days"]} days"
+  [[ ${JOB["$index.compress"]:-0} == 1 ]] && retention+=", compressed"
   [[ ${JOB["$index.enabled"]} == 0 ]] && text="Paused, $text"
   printf '%s: %s, %s' "${JOB["$index.type"]}" "$text" "$retention"
 }
@@ -1168,8 +1462,14 @@ tui_status() {
   for vm in "${VM_IDS[@]+"${VM_IDS[@]}"}"; do
     latest=$(last_backup_of_vm "$vm")
     text+="  $(vm_label "$vm") ($(vm_state "$vm")), last backup: $(format_time "$latest")"$'\n'
+    vm_problems "$vm"
+    local problem
+    for problem in "${PROBLEMS[@]+"${PROBLEMS[@]}"}"; do
+      text+="    ! $(safe_text "$problem")"$'\n'
+    done
   done
   ((${#VM_IDS[@]} > 0)) || text+="  None found"$'\n'
+  text+=$'\n'"$(storage_text)"$'\n'
 
   for index in "${JOB_INDEXES[@]+"${JOB_INDEXES[@]}"}"; do
     job=${JOB["$index.id"]}
@@ -1194,7 +1494,7 @@ tui_status() {
 # Edits a copy of a job and only commits it once it is complete and valid.
 tui_edit_job() {
   local index=$1 is_new=0 value k d="draft"
-  for k in id name type enabled interval_hours at vms keep_count keep_days; do
+  for k in id name type enabled interval_hours at vms keep_count keep_days compress; do
     JOB["$d.$k"]=${JOB["$index.$k"]:-}
   done
   if [[ -z ${JOB["$d.id"]} ]]; then
@@ -1207,6 +1507,7 @@ tui_edit_job() {
     JOB["$d.vms"]="*"
     JOB["$d.keep_count"]=7
     JOB["$d.keep_days"]=30
+    JOB["$d.compress"]=0
   fi
 
   value=$(wt --inputbox "Job name" 0 60 "${JOB["$d.name"]}") || return 1
@@ -1236,6 +1537,18 @@ tui_edit_job() {
   value=$(wt --inputbox "Keep backups for at most this many days (0 = no limit). The newest is never deleted." 0 60 "${JOB["$d.keep_days"]}") || return 1
   JOB["$d.keep_days"]=$value
 
+  if [[ ${JOB["$d.type"]} == backup ]]; then
+    local compress_default=(--defaultno)
+    [[ ${JOB["$d.compress"]} == 1 ]] && compress_default=()
+    if wt "${compress_default[@]}" --yesno "Compress the backups? This saves space, but copying takes longer." 0 0 >/dev/null; then
+      JOB["$d.compress"]=1
+    else
+      JOB["$d.compress"]=0
+    fi
+  else
+    JOB["$d.compress"]=0
+  fi
+
   if wt --yesno "Run this job on its schedule?" 0 0 >/dev/null; then
     JOB["$d.enabled"]=1
   else
@@ -1246,12 +1559,31 @@ tui_edit_job() {
     tui_message "Not saved: $LAST_ERROR"
     return 1
   fi
+  if [[ ${JOB["$d.type"]} == backup ]] && ! tui_confirm_readiness "$d"; then
+    return 1
+  fi
 
-  for k in id name type enabled interval_hours at vms keep_count keep_days; do
+  for k in id name type enabled interval_hours at vms keep_count keep_days compress; do
     JOB["$index.$k"]=${JOB["$d.$k"]}
   done
   ((is_new == 1)) && JOB_INDEXES+=("$index")
   tui_save_jobs
+}
+
+# Warns before saving a job for VMs that can't be backed up while they run.
+tui_confirm_readiness() {
+  local d=$1 vm vms=() text="" problem
+  load_vm_list
+  mapfile -t vms < <(job_vm_list "$d")
+  for vm in "${vms[@]+"${vms[@]}"}"; do
+    [[ $vm =~ $RE_VM_ID ]] && vm_known "$vm" || continue
+    vm_problems "$vm"
+    for problem in "${PROBLEMS[@]+"${PROBLEMS[@]}"}"; do
+      text+="$(vm_label "$vm"): $(safe_text "$problem")"$'\n'
+    done
+  done
+  [[ -z $text ]] && return 0
+  wt --yes-button "Save" --no-button "Back" --yesno "These VMs can't be backed up while they run:\n\n$text\nPowered-off VMs are still backed up. Save the job anyway?" 0 0 >/dev/null
 }
 
 tui_select_vms() {
@@ -1375,7 +1707,8 @@ tui_backups() {
 tui_backup_actions() {
   local path=$1 title=$2 created=$3 size=$4 choice
   choice=$(wt --menu "$title, $(format_time "$created")" 0 0 0 \
-    details "Show details" ova "Create OVA for importing" delete "Delete this backup") || return 0
+    details "Show details" restore "Put this backup back onto the VM" \
+    ova "Create OVA for importing" delete "Delete this backup") || return 0
   case "$choice" in
     details)
       local consistency
@@ -1390,6 +1723,7 @@ Files:
 $(ls -1 -- "$path")"
       ;;
     ova) tui_create_ova "$path" ;;
+    restore) tui_restore "$path" "$title" "$created" ;;
     delete)
       if wt --defaultno --yesno "Permanently delete this backup?\n\n$title, $(format_time "$created")" 0 0 >/dev/null; then
         if ! acquire_lock; then
@@ -1401,6 +1735,49 @@ $(ls -1 -- "$path")"
       fi
       ;;
   esac
+}
+
+tui_restore() {
+  local path=$1 title=$2 created=$3 question kept_text="" file
+  if ! acquire_lock; then
+    tui_message "A backup is running. Try again when it has finished."
+    return 0
+  fi
+  clear 2>/dev/null
+  printf 'Checking the backup...\n'
+  VERBOSE=1
+  if ! restore_prepare "$path"; then
+    VERBOSE=0
+    release_lock
+    tui_message "Can't restore: $LAST_ERROR"
+    return 0
+  fi
+  VERBOSE=0
+  question="Restore $title to the backup from $(format_time "$created")?\n\n"
+  if [[ $RESTORE_STATE == running ]]; then
+    question+="The VM is running. It will be shut down, restored and started again.\n\n"
+  else
+    question+="The VM is off and stays off.\n\n"
+  fi
+  question+="Everything that changed inside the VM since this backup will be lost. Its current disks are kept next to them until you delete them."
+  if ! wt --defaultno --yes-button "Restore" --no-button "Cancel" --yesno "$question" 0 0 >/dev/null; then
+    release_lock
+    return 0
+  fi
+  clear 2>/dev/null
+  VERBOSE=1
+  if restore_run; then
+    VERBOSE=0
+    release_lock
+    for file in "${RESTORE_KEPT[@]}"; do
+      kept_text+="$file\n"
+    done
+    tui_message "Restored.${RESTORE_WARNING:+\n\n$RESTORE_WARNING}\n\nThe previous files are kept here. Delete them once the VM works:\n\n$kept_text"
+  else
+    VERBOSE=0
+    release_lock
+    tui_message "Restore failed: $LAST_ERROR"
+  fi
 }
 
 tui_create_ova() {
@@ -1555,6 +1932,7 @@ on_exit() {
   trap - EXIT TERM INT HUP
   [[ -n $CHILD_PID ]] && kill "$CHILD_PID" 2>/dev/null
   thaw_vm
+  ((RESTORE_ACTIVE == 1)) && restore_rollback
   discard_clones
   discard_staging
   rm -f -- "${TMP_FILES[@]+"${TMP_FILES[@]}"}"
@@ -1563,7 +1941,7 @@ on_exit() {
 }
 
 run_check() {
-  local vm disk target format fs attrs index
+  local vm index problem
   printf 'ugvm-backup %s\nfolder: %s\n' "$VERSION" "$BASE_DIR"
   printf 'qemu-img: %s\n' "$(command -v qemu-img >/dev/null && echo yes || echo NO)"
   printf 'whiptail: %s\n' "$(command -v whiptail >/dev/null && echo yes || echo NO)"
@@ -1573,25 +1951,17 @@ run_check() {
   printf 'VMs: %s\n' "${#VM_IDS[@]}"
   for vm in "${VM_IDS[@]+"${VM_IDS[@]}"}"; do
     printf '\n%s (%s, %s)\n' "$(vm_label "$vm")" "$vm" "$(vm_state "$vm")"
-    if ! load_disks "$vm"; then
-      printf '  problem: %s\n' "$LAST_ERROR"
-      continue
-    fi
+    vm_problems "$vm"
     for index in "${!DISK_TARGETS[@]}"; do
-      disk=${DISK_PATHS[$index]}
-      target=${DISK_TARGETS[$index]}
-      format=${DISK_FORMATS[$index]}
-      fs=$(findmnt -no FSTYPE -T "$disk" 2>/dev/null | head -n 1)
-      attrs=$(lsattr -- "$disk" 2>/dev/null | cut -d' ' -f1)
-      printf '  %s: %s, %s, %s\n' "$target" "$format" "${fs:-unknown file system}" "$disk"
-      [[ $fs == btrfs ]] || printf '  problem: live backups need btrfs\n'
-      [[ $attrs == *C* ]] && printf '  problem: disk has nodatacow set, it cannot be cloned\n'
+      printf '  %s: %s, %s, %s\n' "${DISK_TARGETS[$index]}" "${DISK_FORMATS[$index]}" \
+        "$(findmnt -no FSTYPE -T "${DISK_PATHS[$index]}" 2>/dev/null | head -n 1)" "${DISK_PATHS[$index]}"
     done
-    if [[ $(vm_state "$vm") == running ]] && ! virsh domfsinfo --domain "$vm" >/dev/null 2>&1; then
-      printf '  problem: the guest agent does not answer\n'
-    fi
+    for problem in "${PROBLEMS[@]+"${PROBLEMS[@]}"}"; do
+      printf '  problem: %s\n' "$problem"
+    done
+    ((${#PROBLEMS[@]} == 0)) && printf '  ready for live backups\n'
   done
-  printf '\n'
+  printf '\n%s\n\n' "$(storage_text)"
   load_config
   if [[ -n $CONFIG_ERROR ]]; then
     printf 'config: ERROR: %s\n' "$CONFIG_ERROR"
@@ -1642,7 +2012,7 @@ run_named_job() {
 }
 
 print_help() {
-  sed -n '3,15p' "$SCRIPT_PATH" | sed 's/^# \{0,1\}//'
+  sed -n '3,16p' "$SCRIPT_PATH" | sed 's/^# \{0,1\}//'
 }
 
 main() {
@@ -1652,6 +2022,7 @@ main() {
       --run) action=run; shift ;;
       --now) action=now; argument=${2:-}; shift 2 || exit 2 ;;
       --ova) action=ova; argument=${2:-}; shift 2 || exit 2 ;;
+      --restore) action=restore; argument=${2:-}; shift 2 || exit 2 ;;
       --check) action=check; shift ;;
       --update) action=update; shift ;;
       --yes) assume_yes=1; shift ;;
@@ -1677,6 +2048,7 @@ main() {
     now) run_named_job "$argument" ;;
     check) run_check ;;
     update) cli_update "$assume_yes" ;;
+    restore) cli_restore "$argument" "$assume_yes" || exit 1 ;;
     ova)
       acquire_lock || { printf 'Another backup is running.\n' >&2; exit 1; }
       VERBOSE=1

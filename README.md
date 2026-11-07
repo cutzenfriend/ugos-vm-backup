@@ -36,7 +36,7 @@ sudo bash /volume1/VMBackup/ugvm-backup.sh
 - `qemu-guest-agent` running inside each VM you back up while it runs
 - `whiptail` and `curl`, which were already on the NAS this was tested on
 
-`--check` shows whether your NAS and VMs meet these requirements, and how much space is left. It changes nothing. The status page in the interface shows the same, and saving a job warns about VMs that can't be backed up while they run.
+`--check` shows whether your NAS and VMs meet these requirements, and how much space is left. It changes nothing. The main menu says whether all VMs are ready for live backups, the status page shows the details, and saving a job warns about VMs that can't be backed up while they run.
 
 ```bash
 sudo bash /volume1/VMBackup/ugvm-backup.sh --check
@@ -119,7 +119,7 @@ The previous disks stay next to the new ones with the ending `.before-restore-<t
 
 ## Updating
 
-**update** in the interface compares your version with the one on GitHub and installs a newer one after you confirm. Cron never updates the script. The previous version stays next to it as `ugvm-backup.sh.previous`.
+When the interface starts, it checks GitHub for a newer version and shows it in the main menu. **update** installs it after you confirm. Cron never updates the script. The previous version stays next to it as `ugvm-backup.sh.previous`.
 
 ## Security
 

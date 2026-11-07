@@ -29,7 +29,7 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export LIBVIRT_DEFAULT_URI=qemu:///system
 umask 077
 
-readonly VERSION="2.1.0"
+readonly VERSION="2.1.1"
 readonly CONFIG_FORMAT=2
 readonly UPDATE_URL="${UGVM_UPDATE_URL:-https://raw.githubusercontent.com/cutzenfriend/ugos-vm-backup/main/ugvm-backup.sh}"
 readonly MAX_CONFIG_BYTES=65536
@@ -89,6 +89,7 @@ RESTORE_WARNING=""
 RESTORE_MOVED=()
 RESTORE_OLD=()
 RESTORE_KEPT=()
+AVAILABLE_UPDATE=""
 
 # --- Logging and small helpers ------------------------------------------------
 
@@ -1308,14 +1309,14 @@ version_is_newer() {
 # Downloads next to the script, so the final step is an atomic rename. Sets
 # UPDATE_FILE and UPDATE_VERSION when a newer valid version is available.
 fetch_update() {
-  local err
+  local max_time=${1:-120} err
   UPDATE_FILE=""
   UPDATE_VERSION=""
   UPDATE_FILE=$(mktemp "$BASE_DIR/.ugvm-update.XXXXXXXX") || { fail "Could not create a temporary file"; return 1; }
   err=$(new_private_file) || err=/dev/null
   [[ $err != /dev/null ]] && TMP_FILES+=("$err")
   TMP_FILES+=("$UPDATE_FILE")
-  if ! curl -fsSL --proto '=https,file' --max-time 120 --max-filesize 5000000 -o "$UPDATE_FILE" -- "$UPDATE_URL" 2>"$err"; then
+  if ! curl -fsSL --proto '=https,file' --connect-timeout 5 --max-time "$max_time" --max-filesize 5000000 -o "$UPDATE_FILE" -- "$UPDATE_URL" 2>"$err"; then
     fail "Download failed: $(last_line "$err")"
     return 1
   fi
@@ -1817,6 +1818,33 @@ tui_cron() {
   fi
 }
 
+# Checked once on start with a short timeout, so a NAS without internet starts as
+# fast as before and simply shows no hint.
+check_for_update_quietly() {
+  AVAILABLE_UPDATE=""
+  fetch_update 8 2>/dev/null || return 0
+  version_is_newer "$UPDATE_VERSION" "$VERSION" && AVAILABLE_UPDATE=$UPDATE_VERSION
+  rm -f -- "$UPDATE_FILE"
+  return 0
+}
+
+readiness_line() {
+  local vm names=() count=0
+  load_vm_list
+  for vm in "${VM_IDS[@]+"${VM_IDS[@]}"}"; do
+    count=$((count + 1))
+    vm_problems "$vm"
+    ((${#PROBLEMS[@]} > 0)) && names+=("$(vm_label "$vm")")
+  done
+  if ((count == 0)); then
+    printf 'Live backups: no VMs found'
+  elif ((${#names[@]} == 0)); then
+    printf 'Live backups: all %s VMs are ready' "$count"
+  else
+    printf 'Live backups NOT possible for: %s (see status)' "$(IFS=,; printf '%s' "${names[*]}" | sed 's/,/, /g')"
+  fi
+}
+
 # Without the cron line, jobs silently never run, so this is checked on every start.
 tui_offer_schedule() {
   cron_installed && return 0
@@ -1864,8 +1892,11 @@ tui_main() {
   [[ -n $CONFIG_ERROR ]] && tui_message "config.ini can't be used: $CONFIG_ERROR\n\nFix or delete the file to change jobs here."
 
   tui_offer_schedule
+  printf 'Checking for updates...\n'
+  check_for_update_quietly
 
-  local choice schedule cron_action
+  local choice schedule cron_action header update_item="Check for a new version"
+  [[ -n $AVAILABLE_UPDATE ]] && update_item="Install version $AVAILABLE_UPDATE"
   while :; do
     if cron_installed; then
       schedule="Schedule: active"
@@ -1874,12 +1905,14 @@ tui_main() {
       schedule="Schedule: NOT active, jobs don't run on their own"
       cron_action="Turn the schedule on"
     fi
-    choice=$(wt --menu "$schedule\n\nWhat do you want to do?" 0 0 0 \
+    header="$schedule\n$(readiness_line)"
+    [[ -n $AVAILABLE_UPDATE ]] && header+="\nUpdate available: $VERSION -> $AVAILABLE_UPDATE (choose update)"
+    choice=$(wt --menu "$header\n\nWhat do you want to do?" 0 0 0 \
       status "Overview and problems" \
       jobs "Create and change backup jobs" \
       backups "Show backups, create OVAs" \
       cron "$cron_action" \
-      update "Check for a new version" \
+      update "$update_item" \
       exit "Leave") || break
     case "$choice" in
       status) tui_status ;;

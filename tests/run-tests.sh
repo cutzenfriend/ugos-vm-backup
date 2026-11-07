@@ -18,6 +18,8 @@ FAKE=/tmp/fakevirt
 ANSWERS=/tmp/whiptail-answers
 
 install -m 0755 /src/tests/stub-virsh /usr/bin/virsh
+# The interface looks for updates on start. Tests never reach GitHub.
+export UGVM_UPDATE_URL=file:///tmp/no-update-here
 
 # The script looks in /usr/sbin first, so test doubles go there. The container's
 # file system can't clone files, so "cp --reflink" becomes a normal copy that
@@ -824,6 +826,40 @@ check "going back saves nothing" test ! -e "$BASE/config.ini"
 printf '0 jobs\n0 new\n0 Nightly\n0 backup\n0 vm-a\n0 24\n0 03:00\n0 3\n0 0\n1\n0\n0\n0\n1\n0 exit\n' >"$ANSWERS"
 tui_main
 check "saving anyway keeps the job" grep -q '^name=Nightly$' "$BASE/config.ini"
+
+echo "== menu header"
+
+begin "header-ready"
+new_vm vm-a running
+printf '0 exit\n' >"$ANSWERS"
+tui_main
+check "header says all VMs are ready" grep -q 'Live backups: all 1 VMs are ready' /tmp/whiptail-calls
+refute "no update hint without an update" grep -q 'Update available' /tmp/whiptail-calls
+
+begin "header-problem"
+new_vm vm-a running
+touch "$FAKE/not-btrfs"
+printf '0 exit\n' >"$ANSWERS"
+tui_main
+check "header names the VM without live backups" grep -q 'Live backups NOT possible for: Test VM (see status)' /tmp/whiptail-calls
+
+begin "header-update"
+new_vm vm-a running
+sed 's/^readonly VERSION=.*/readonly VERSION="9.9.9"/' "$SOURCE_SCRIPT" >/tmp/remote.sh
+printf '0 exit\n' >"$ANSWERS"
+UGVM_UPDATE_URL=file:///tmp/remote.sh tui_main
+check "header announces the new version" grep -q 'Update available: .* -> 9.9.9 (choose update)' /tmp/whiptail-calls
+check "menu entry names the new version" grep -q 'Install version 9.9.9' /tmp/whiptail-calls
+check "nothing installed by looking" cmp -s "$SOURCE_SCRIPT" "$SCRIPT"
+check "no temporary file left" test "$(find "$BASE" -name '.ugvm-update.*' | wc -l)" = 0
+
+begin "header-offline"
+new_vm vm-a running
+printf '0 exit\n' >"$ANSWERS"
+started=$(date +%s)
+UGVM_UPDATE_URL=https://192.0.2.1/ugvm-backup.sh tui_main
+refute "offline start shows no update hint" grep -q 'Update available' /tmp/whiptail-calls
+check "offline start waits at most a few seconds" test "$(($(date +%s) - started))" -le 12
 
 echo "== compression and priority"
 
